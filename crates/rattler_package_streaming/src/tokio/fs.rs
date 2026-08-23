@@ -65,6 +65,41 @@ pub async fn extract_conda(
     }
 }
 
+/// Extracts the contents a `.whl` (wheel) package archive at the specified
+/// path to a directory.
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() {
+/// # use std::path::Path;
+/// use rattler_package_streaming::tokio::fs::extract_wheel;
+/// let _ = extract_wheel(
+///     Path::new("six-1.9.0-py2.py3-none-any.whl"),
+///     Path::new("/tmp"))
+///     .await
+///     .unwrap();
+/// # }
+/// ```
+pub async fn extract_wheel(
+    archive: &Path,
+    destination: &Path,
+) -> Result<ExtractResult, ExtractError> {
+    // Spawn a blocking task to perform the extraction
+    let destination = destination.to_owned();
+    let archive = archive.to_owned();
+    match tokio::task::spawn_blocking(move || crate::fs::extract_wheel(&archive, &destination))
+        .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            if let Ok(reason) = err.try_into_panic() {
+                std::panic::resume_unwind(reason);
+            }
+            Err(ExtractError::Cancelled)
+        }
+    }
+}
+
 /// Extracts the contents a package archive at the specified path to a directory. The type of
 /// package is determined based on the file extension of the archive path.
 ///

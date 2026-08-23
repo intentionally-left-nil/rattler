@@ -13,6 +13,7 @@ mod no_softlink;
 mod package_metadata;
 mod paths;
 mod run_exports;
+pub mod wheel;
 
 use std::io::Read;
 use std::path::Path;

@@ -5,6 +5,7 @@ use crate::ExtractError;
 use crate::read::{stream_tar_bz2, stream_tar_zst};
 use rattler_conda_types::package::CondaArchiveType;
 use rattler_conda_types::package::PackageFile;
+use rattler_conda_types::package::wheel::map_wheel_archive_path;
 use std::fs::File;
 use std::io::Write;
 use std::{
@@ -134,6 +135,52 @@ pub fn read_package_file<P: PackageFile>(path: impl AsRef<Path>) -> Result<P, Ex
 
     P::from_slice(&content)
         .map_err(|e| ExtractError::ArchiveMemberParseError(P::package_path().to_owned(), e))
+}
+
+/// Extracts the contents of a wheel archive (a plain zip file) into
+/// `destination`, remapping each entry's path onto rattler's
+/// noarch-python-style install convention using
+/// [`map_wheel_archive_path`].
+///
+/// Unlike `.conda`/`.tar.bz2` extraction this does not stream: it requires a
+/// [`Seek`]-able reader since the underlying [`zip::ZipArchive`] needs random
+/// access to read the central directory. Callers that only have a streaming
+/// (e.g. HTTP) source should buffer the archive first (see
+/// [`crate::tokio::async_read::extract_wheel_via_buffering`]).
+pub fn extract_wheel_contents<R: Read + Seek>(
+    reader: R,
+    destination: &Path,
+) -> Result<(), ExtractError> {
+    std::fs::create_dir_all(destination).map_err(ExtractError::CouldNotCreateDestination)?;
+
+    let mut archive = zip::ZipArchive::new(reader)?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        if entry.is_dir() {
+            continue;
+        }
+        let Some(enclosed) = entry.enclosed_name() else {
+            // Skip entries with unsafe (e.g. zip-slip) paths.
+            continue;
+        };
+        let mapped = map_wheel_archive_path(&enclosed);
+        let out_path = destination.join(&mapped);
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut out_file = File::create(&out_path)?;
+        std::io::copy(&mut entry, &mut out_file)?;
+
+        #[cfg(unix)]
+        if let Some(mode) = entry.unix_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            // Best-effort: a failure to set permissions should not fail the
+            // whole extraction.
+            let _ = std::fs::set_permissions(&out_path, std::fs::Permissions::from_mode(mode));
+        }
+    }
+
+    Ok(())
 }
 
 /// Get a [`PackageFile`] from temporary archive and extract it to a writer

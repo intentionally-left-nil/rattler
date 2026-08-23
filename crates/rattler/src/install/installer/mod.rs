@@ -23,7 +23,8 @@ use itertools::Itertools;
 use rattler_cache::package_cache::{CacheMetadata, CacheReporter};
 use rattler_conda_types::{
     MatchSpec, PackageName, PackageNameMatcher, PackageRecord, Platform, PrefixRecord,
-    RepoDataRecord, prefix_record::Link, utils::ensure_safe_path_component,
+    RepoDataRecord, package::DistArchiveType, prefix_record::Link,
+    utils::ensure_safe_path_component,
 };
 use rattler_networking::{LazyClient, retry_policies::default_retry_policy};
 use rayon::prelude::*;
@@ -77,6 +78,7 @@ impl From<&rattler_config::config::CommonConfig> for LinkOptions {
 pub struct Installer {
     installed: Option<Vec<PrefixRecord>>,
     package_cache: Option<PackageCache>,
+    wheel_cache_dir: Option<PathBuf>,
     downloader: Option<LazyClient>,
     execute_link_scripts: bool,
     io_semaphore: Option<Arc<Semaphore>>,
@@ -262,6 +264,29 @@ impl Installer {
     /// existing instance.
     pub fn set_package_cache(&mut self, package_cache: PackageCache) -> &mut Self {
         self.package_cache = Some(package_cache);
+        self
+    }
+
+    /// Sets the directory used to cache extracted Python wheels.
+    ///
+    /// Wheels (packages referenced through a `v3.whl` repodata entry, see
+    /// [`crate::install::wheel`]) are cached separately from regular conda
+    /// packages. Defaults to a `wheel-pkgs` directory next to the default
+    /// conda package cache when not set.
+    #[must_use]
+    pub fn with_wheel_cache_dir(self, wheel_cache_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            wheel_cache_dir: Some(wheel_cache_dir.into()),
+            ..self
+        }
+    }
+
+    /// Sets the directory used to cache extracted Python wheels.
+    ///
+    /// This function is similar to [`Self::with_wheel_cache_dir`], but
+    /// modifies an existing instance.
+    pub fn set_wheel_cache_dir(&mut self, wheel_cache_dir: impl Into<PathBuf>) -> &mut Self {
+        self.wheel_cache_dir = Some(wheel_cache_dir.into());
         self
     }
 
@@ -623,6 +648,11 @@ impl Installer {
                     .join(rattler_cache::PACKAGE_CACHE_DIR),
             )
         });
+        let wheel_cache_dir = self.wheel_cache_dir.unwrap_or_else(|| {
+            default_cache_dir()
+                .expect("failed to determine default cache directory")
+                .join(rattler_cache::WHEEL_CACHE_DIR)
+        });
 
         // Acquire a global lock on the package cache for the entire installation.
         // This significantly reduces overhead by avoiding per-package locking.
@@ -722,6 +752,7 @@ impl Installer {
         {
             let downloader = &downloader;
             let package_cache = &package_cache;
+            let wheel_cache_dir = &wheel_cache_dir;
             let reporter = self.reporter.clone();
             let base_install_options = &base_install_options;
             let driver = &driver;
@@ -741,24 +772,45 @@ impl Installer {
                     let downloader = downloader.clone();
                     let reporter = reporter.clone();
                     let package_cache = package_cache.clone();
+                    let wheel_cache_dir = wheel_cache_dir.clone();
                     let concurrent_requests_semaphore = concurrent_requests_semaphore.clone();
                     tokio::spawn(async move {
                         let populate_cache_report = reporter.clone().map(|r| {
                             let cache_index = r.on_populate_cache_start(operation_idx, &record);
                             (r, cache_index)
                         });
-                        let cache_metadata = populate_cache(
-                            &record,
-                            downloader,
-                            &package_cache,
-                            populate_cache_report.clone(),
-                            concurrent_requests_semaphore,
-                        )
-                        .await?;
+                        let fetched = if matches!(
+                            record.identifier.archive_type,
+                            DistArchiveType::Wheel(_)
+                        ) {
+                            let cached_dir = crate::install::wheel::populate_wheel_cache(
+                                &record,
+                                &wheel_cache_dir,
+                                downloader,
+                            )
+                            .await
+                            .map_err(|e| {
+                                InstallerError::FailedToInstallWheel(
+                                    record.identifier.to_string(),
+                                    e,
+                                )
+                            })?;
+                            FetchedPackage::Wheel(cached_dir)
+                        } else {
+                            let cache_metadata = populate_cache(
+                                &record,
+                                downloader,
+                                &package_cache,
+                                populate_cache_report.clone(),
+                                concurrent_requests_semaphore,
+                            )
+                            .await?;
+                            FetchedPackage::Conda(Box::new(cache_metadata))
+                        };
                         if let Some((reporter, index)) = populate_cache_report {
                             reporter.on_populate_cache_complete(index);
                         }
-                        Ok((cache_metadata, record))
+                        Ok((fetched, record))
                     })
                     .map_err(JoinError::try_into_panic)
                     .map(|res| match res {
@@ -773,7 +825,7 @@ impl Installer {
                 };
 
                 // Install the package if it was fetched.
-                if let Some((cache_metadata, record)) = package_to_install.await? {
+                if let Some((fetched, record)) = package_to_install.await? {
                     let reporter = reporter
                         .as_deref()
                         .map(|r| (r, r.on_link_start(operation_idx, &record)));
@@ -781,24 +833,47 @@ impl Installer {
                         .and_then(|mapping| mapping.get(&record.package_record.name).cloned())
                         .unwrap_or_default();
 
-                    // Reuse index_json and paths_json from cache validation if available
-                    let mut install_options = base_install_options.clone();
-                    if let Some(index_json) = cache_metadata.index_json() {
-                        install_options.index_json = Some(index_json.clone());
-                    }
-                    if let Some(paths_json) = cache_metadata.paths_json() {
-                        install_options.paths_json = Some(paths_json.clone());
+                    match fetched {
+                        FetchedPackage::Conda(cache_metadata) => {
+                            // Reuse index_json and paths_json from cache validation if available
+                            let mut install_options = base_install_options.clone();
+                            if let Some(index_json) = cache_metadata.index_json() {
+                                install_options.index_json = Some(index_json.clone());
+                            }
+                            if let Some(paths_json) = cache_metadata.paths_json() {
+                                install_options.paths_json = Some(paths_json.clone());
+                            }
+
+                            link_package(
+                                &record,
+                                prefix,
+                                cache_metadata.path(),
+                                install_options,
+                                driver,
+                                requested_spec,
+                            )
+                            .await?;
+                        }
+                        FetchedPackage::Wheel(cached_wheel_dir) => {
+                            crate::install::wheel::install_wheel(
+                                &record,
+                                prefix,
+                                &cached_wheel_dir,
+                                downloader.clone(),
+                                base_install_options.clone(),
+                                driver,
+                                requested_spec,
+                            )
+                            .await
+                            .map_err(|e| {
+                                InstallerError::FailedToInstallWheel(
+                                    record.identifier.to_string(),
+                                    e,
+                                )
+                            })?;
+                        }
                     }
 
-                    link_package(
-                        &record,
-                        prefix,
-                        cache_metadata.path(),
-                        install_options,
-                        driver,
-                        requested_spec,
-                    )
-                    .await?;
                     if let Some((reporter, index)) = reporter {
                         reporter.on_link_complete(index);
                     }
@@ -852,6 +927,18 @@ impl Installer {
             clobbered_paths: post_process_result.clobbered_paths,
         })
     }
+}
+
+/// The result of populating the cache with a package that is about to be
+/// installed. Conda packages (`.conda`/`.tar.bz2`) and wheels (`.whl`) use
+/// distinct caching and extraction strategies (see
+/// [`crate::install::wheel`]), so this distinguishes which one was used.
+enum FetchedPackage {
+    /// A regular conda package, extracted into the conda package cache.
+    Conda(Box<CacheMetadata>),
+    /// A Python wheel, extracted into the wheel cache. Holds the directory
+    /// containing the extracted wheel contents.
+    Wheel(PathBuf),
 }
 
 async fn link_package(

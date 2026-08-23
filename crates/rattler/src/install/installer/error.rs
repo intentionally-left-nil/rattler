@@ -35,6 +35,10 @@ pub enum InstallerError {
     #[error("failed to link {0}")]
     LinkError(String, #[source] InstallError),
 
+    /// Failed to fetch or install a wheel
+    #[error("failed to install wheel {0}")]
+    FailedToInstallWheel(String, #[source] crate::install::wheel::WheelInstallError),
+
     /// Failed to unlink a certain package
     #[error("failed to unlink {0}")]
     UnlinkError(String, #[source] UnlinkError),

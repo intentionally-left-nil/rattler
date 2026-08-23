@@ -91,3 +91,4 @@ walkdir.workspace = true
 mockito = "=1.7.2"
 tempfile = { workspace = true }
 temp-env = { workspace = true }
+zip = { workspace = true, features = ["deflate", "time"] }

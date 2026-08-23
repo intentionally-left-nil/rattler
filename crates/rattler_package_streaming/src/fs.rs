@@ -7,6 +7,7 @@ use rattler_conda_types::{
 };
 use rattler_digest::Sha256;
 use std::fs::File;
+use std::io::BufReader;
 use std::path::Path;
 
 /// Extracts the contents a `.tar.bz2` package archive at the specified path to a directory.
@@ -37,6 +38,47 @@ pub fn extract_tar_bz2(archive: &Path, destination: &Path) -> Result<ExtractResu
 pub fn extract_conda(archive: &Path, destination: &Path) -> Result<ExtractResult, ExtractError> {
     let file = File::open(archive)?;
     crate::read::extract_conda_via_streaming(file, destination)
+}
+
+/// Extracts the contents of a wheel (`.whl`) package archive at the specified
+/// path to a directory, remapping wheel-internal paths onto rattler's
+/// noarch-python install convention (see
+/// [`rattler_conda_types::package::wheel::map_wheel_archive_path`]).
+///
+/// ```rust,no_run
+/// # use std::path::Path;
+/// use rattler_package_streaming::fs::extract_wheel;
+/// let _ = extract_wheel(
+///     Path::new("six-1.9.0-py2.py3-none-any.whl"),
+///     Path::new("/tmp"))
+///     .unwrap();
+/// ```
+pub fn extract_wheel(archive: &Path, destination: &Path) -> Result<ExtractResult, ExtractError> {
+    let result = hash_and_size(archive)?;
+
+    let file = File::open(archive)?;
+    crate::seek::extract_wheel_contents(file, destination)?;
+
+    Ok(result)
+}
+
+/// Computes the sha256, md5 and total size of the file at `path`.
+fn hash_and_size(path: &Path) -> Result<ExtractResult, ExtractError> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let sha256_reader = rattler_digest::HashingReader::<_, rattler_digest::Sha256>::new(reader);
+    let mut md5_reader =
+        rattler_digest::HashingReader::<_, rattler_digest::Md5>::new(sha256_reader);
+    let mut size_reader = crate::read::SizeCountingReader::new(&mut md5_reader);
+    std::io::copy(&mut size_reader, &mut std::io::sink())?;
+    let (_, total_size) = size_reader.finalize();
+    let (sha256_reader, md5) = md5_reader.finalize();
+    let (_, sha256) = sha256_reader.finalize();
+    Ok(ExtractResult {
+        sha256,
+        md5,
+        total_size,
+    })
 }
 
 /// Extracts the contents a package archive at the specified path to a directory. The type of
@@ -160,6 +202,7 @@ pub async fn repodata_record_from_package_archive(
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::io::Write;
     use std::path::Path;
 
     #[tokio::test]
@@ -219,5 +262,71 @@ mod test {
 
         assert_eq!(record.package_record.name.as_normalized(), "clobber-fd-1");
         assert_eq!(record.channel, None);
+    }
+
+    /// Builds a minimal, but structurally realistic, wheel archive containing:
+    /// - a root-level module (maps to `site-packages/`)
+    /// - a `.dist-info/RECORD` and `.dist-info/entry_points.txt` (also root-level)
+    /// - a `.data/scripts/` file (maps to `python-scripts/`)
+    /// - a `.data/platlib/` file, simulating a compiled/subdir-specific wheel
+    ///   (also maps to `site-packages/`)
+    fn build_test_wheel(path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+
+        zip.start_file("demo.py", options).unwrap();
+        zip.write_all(b"print('hello')\n").unwrap();
+
+        zip.start_file("demo-1.0.dist-info/RECORD", options)
+            .unwrap();
+        zip.write_all(b"demo.py,sha256=,16\ndemo-1.0.dist-info/RECORD,,\n")
+            .unwrap();
+
+        zip.start_file("demo-1.0.dist-info/entry_points.txt", options)
+            .unwrap();
+        zip.write_all(b"[console_scripts]\ndemo-cli = demo:main\n")
+            .unwrap();
+
+        zip.start_file("demo-1.0.data/scripts/demo-script", options)
+            .unwrap();
+        zip.write_all(b"#!/bin/sh\necho hi\n").unwrap();
+
+        zip.start_file("demo-1.0.data/platlib/_demo_native.so", options)
+            .unwrap();
+        zip.write_all(b"not-really-a-shared-library").unwrap();
+
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn test_extract_wheel_remaps_paths() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wheel_path = temp_dir.path().join("demo-1.0-py3-none-any.whl");
+        build_test_wheel(&wheel_path);
+
+        let destination = temp_dir.path().join("extracted");
+        let result = extract_wheel(&wheel_path, &destination).unwrap();
+        assert!(result.total_size > 0);
+
+        // Root-level files land under `site-packages/`.
+        assert!(destination.join("site-packages/demo.py").is_file());
+        assert!(
+            destination
+                .join("site-packages/demo-1.0.dist-info/RECORD")
+                .is_file()
+        );
+        assert!(
+            destination
+                .join("site-packages/demo-1.0.dist-info/entry_points.txt")
+                .is_file()
+        );
+
+        // `.data/scripts/` maps to `python-scripts/`.
+        assert!(destination.join("python-scripts/demo-script").is_file());
+
+        // `.data/platlib/` (compiled/subdir-specific content) also maps to
+        // `site-packages/`.
+        assert!(destination.join("site-packages/_demo_native.so").is_file());
     }
 }

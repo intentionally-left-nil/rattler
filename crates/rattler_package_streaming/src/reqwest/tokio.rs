@@ -197,6 +197,42 @@ pub async fn extract_conda(
     }
 }
 
+/// Extracts the contents a `.whl` (wheel) package archive from the specified
+/// remote location.
+///
+/// ```rust,no_run
+/// # #[tokio::main]
+/// # async fn main() {
+/// # use std::path::Path;
+/// use url::Url;
+/// use reqwest::Client;
+/// use reqwest_middleware::ClientWithMiddleware;
+/// use rattler_package_streaming::reqwest::tokio::extract_wheel;
+/// let _ = extract_wheel(
+///     ClientWithMiddleware::from(Client::new()),
+///     Url::parse("https://files.pythonhosted.org/packages/.../six-1.9.0-py2.py3-none-any.whl").unwrap(),
+///     Path::new("/tmp"),
+///     None,
+///     None)
+///     .await
+///     .unwrap();
+/// # }
+/// ```
+pub async fn extract_wheel(
+    client: reqwest_middleware::ClientWithMiddleware,
+    url: Url,
+    destination: &Path,
+    expected_sha256: Option<Sha256Hash>,
+    reporter: Option<Arc<dyn DownloadReporter>>,
+) -> Result<ExtractResult, ExtractError> {
+    let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
+    let result = crate::tokio::async_read::extract_wheel_via_buffering(reader, destination).await?;
+    if let Some(reporter) = &reporter {
+        reporter.on_download_complete();
+    }
+    Ok(result)
+}
+
 /// Extracts the contents a package archive from the specified remote location.
 /// The type of package is determined based on the path of the url.
 ///

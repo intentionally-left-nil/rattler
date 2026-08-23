@@ -228,6 +228,68 @@ pub async fn extract_conda_via_buffering(
     })
 }
 
+/// Extracts the contents of a wheel (`.whl`) archive from a streaming
+/// [`AsyncRead`] source by fully buffering it in memory first.
+///
+/// Unlike `.conda`/`.tar.bz2` extraction, wheel extraction requires random
+/// access (the underlying [`zip::ZipArchive`] needs to read the central
+/// directory), so a streaming HTTP source cannot be extracted on-the-fly.
+/// Wheels are typically small (from a few KB up to, at most, a few hundred MB
+/// for large compiled packages), so buffering the whole archive in memory
+/// before extracting - the same trade-off `pip` itself makes - is an
+/// acceptable simplification here.
+pub async fn extract_wheel_via_buffering(
+    reader: impl AsyncRead + Send + Unpin + 'static,
+    destination: &Path,
+) -> Result<ExtractResult, ExtractError> {
+    // Ensure the destination directory exists
+    tokio::fs::create_dir_all(destination)
+        .await
+        .map_err(ExtractError::CouldNotCreateDestination)?;
+    let destination = destination.to_owned();
+
+    // Wrap the reading in additional readers that will compute the hashes while
+    // buffering the archive.
+    let sha256_reader = rattler_digest::HashingReader::<_, rattler_digest::Sha256>::new(reader);
+    let mut md5_reader =
+        rattler_digest::HashingReader::<_, rattler_digest::Md5>::new(sha256_reader);
+    let mut size_reader = SizeCountingReader::new(&mut md5_reader);
+
+    let mut buffer = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut size_reader, &mut buffer)
+        .await
+        .map_err(ExtractError::IoError)?;
+
+    // Get the size and hashes
+    let (_, total_size) = size_reader.finalize();
+    let (sha256_reader, md5) = md5_reader.finalize();
+    let (_, sha256) = sha256_reader.finalize();
+
+    if total_size == 0 {
+        return Err(ExtractError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "no data was read from the package stream - the stream may have been truncated",
+        )));
+    }
+
+    tokio::task::spawn_blocking(move || {
+        crate::seek::extract_wheel_contents(std::io::Cursor::new(buffer), &destination)
+    })
+    .await
+    .map_err(|err| {
+        if let Ok(reason) = err.try_into_panic() {
+            std::panic::resume_unwind(reason);
+        }
+        ExtractError::Cancelled
+    })??;
+
+    Ok(ExtractResult {
+        sha256,
+        md5,
+        total_size,
+    })
+}
+
 /// Async equivalent of [`crate::seek::get_file_from_archive`].
 ///
 /// Iterates entries of a tar archive, returning the contents of the first

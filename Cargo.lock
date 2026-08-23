@@ -4931,6 +4931,7 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "zip",
 ]
 
 [[package]]
@@ -5024,6 +5025,7 @@ version = "0.52.1"
 dependencies = [
  "ahash",
  "assert_matches",
+ "base64 0.22.1",
  "core-foundation 0.10.1",
  "criterion",
  "dirs",

@@ -28,6 +28,7 @@ pub mod unlink;
 mod installer;
 #[cfg(test)]
 mod test_utils;
+pub mod wheel;
 
 #[cfg(unix)]
 use std::sync::OnceLock;

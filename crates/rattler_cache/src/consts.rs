@@ -1,5 +1,9 @@
 /// The location in the main cache folder where the conda package cache is stored.
 pub const PACKAGE_CACHE_DIR: &str = "pkgs";
+/// The location in the main cache folder where extracted Python wheels are
+/// cached (separate from the conda `packages` cache since wheels have a
+/// different validation/extraction strategy).
+pub const WHEEL_CACHE_DIR: &str = "wheel-pkgs";
 pub const RUN_EXPORTS_CACHE_DIR: &str = "run-exports";
 /// The location in the main cache folder where the repodata cache is stored.
 pub const REPODATA_CACHE_DIR: &str = "repodata";

@@ -1,6 +1,6 @@
 //! Shared functionality for async extraction operations.
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use async_compression::tokio::bufread::ZstdDecoder;
 use futures_util::stream::StreamExt;
@@ -157,6 +157,68 @@ pub(super) async fn extract_tar_zst_entry<R: tokio::io::AsyncRead + Unpin>(
 
     // Unpack the tar archive
     unpack_tar_archive(archive, destination).await?;
+
+    Ok(())
+}
+
+/// Sanitizes a zip entry's filename into a safe, relative [`PathBuf`],
+/// rejecting embedded NUL bytes, absolute paths, and paths that would
+/// escape the extraction root via `..` components.
+///
+/// This mirrors [`zip::read::ZipFile::enclosed_name`] (used by the sync,
+/// seek-based wheel extraction path in [`crate::seek`]) for the
+/// `async_zip`-based streaming/seek paths here, which don't provide an
+/// equivalent convenience method.
+pub(super) fn sanitize_zip_entry_name(name: &str) -> Option<PathBuf> {
+    if name.contains('\0') {
+        return None;
+    }
+
+    let path = PathBuf::from(name);
+    let mut depth: usize = 0;
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => return None,
+            Component::ParentDir => depth = depth.checked_sub(1)?,
+            Component::Normal(_) => depth += 1,
+            Component::CurDir => {}
+        }
+    }
+    Some(path)
+}
+
+/// If `mode` indicates that the file should be executable (any of the
+/// user/group/other execute bits set), ensures `path` has the executable bit
+/// set. This is a no-op on non-Unix platforms, or when `mode` is `None` or
+/// doesn't indicate an executable file.
+pub(super) async fn apply_executable_bit(
+    #[cfg_attr(not(unix), allow(unused_variables))] mode: Option<u32>,
+    #[cfg_attr(not(unix), allow(unused_variables))] path: &Path,
+) -> Result<(), ExtractError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(mode) = mode else {
+            return Ok(());
+        };
+        if mode & EXECUTABLE_MODE_BITS == 0 {
+            return Ok(());
+        }
+
+        let metadata = tokio::fs::metadata(path)
+            .await
+            .map_err(ExtractError::IoError)?;
+        let permissions = metadata.permissions();
+        if permissions.mode() & EXECUTABLE_MODE_BITS != EXECUTABLE_MODE_BITS {
+            tokio::fs::set_permissions(
+                path,
+                std::fs::Permissions::from_mode(permissions.mode() | EXECUTABLE_MODE_BITS),
+            )
+            .await
+            .map_err(ExtractError::IoError)?;
+        }
+    }
 
     Ok(())
 }

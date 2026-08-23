@@ -228,17 +228,26 @@ pub async fn extract_conda_via_buffering(
     })
 }
 
-/// Extracts the contents of a wheel (`.whl`) archive from a streaming
-/// [`AsyncRead`] source by fully buffering it in memory first.
+/// Extracts the contents of a wheel (`.whl`) archive using a fully async,
+/// streaming implementation. This performs on-the-fly extraction while the
+/// archive is being read (e.g. while it's being downloaded), without
+/// requiring the whole archive to be buffered first.
 ///
-/// Unlike `.conda`/`.tar.bz2` extraction, wheel extraction requires random
-/// access (the underlying [`zip::ZipArchive`] needs to read the central
-/// directory), so a streaming HTTP source cannot be extracted on-the-fly.
-/// Wheels are typically small (from a few KB up to, at most, a few hundred MB
-/// for large compiled packages), so buffering the whole archive in memory
-/// before extracting - the same trade-off `pip` itself makes - is an
-/// acceptable simplification here.
-pub async fn extract_wheel_via_buffering(
+/// Each entry's (remapped, see
+/// [`rattler_conda_types::package::wheel::map_wheel_archive_path`])
+/// destination path is written to as soon as its local file header is
+/// encountered. Unix executable permission bits, however, are only stored in
+/// the *central directory* at the end of the archive - not in the local
+/// headers - so after streaming through every entry, this continues reading
+/// forward into the central directory (mirroring what `uv` and `pip` do) to
+/// recover and apply them.
+///
+/// Like [`extract_conda`], this can fail with
+/// [`ExtractError::ZipError`]`(`[`zip::result::ZipError::UnsupportedArchive`]`(_))`
+/// if the archive uses zip data descriptors in a way that's incompatible
+/// with streaming; callers should fall back to
+/// [`extract_wheel_via_buffering`] in that case.
+pub async fn extract_wheel(
     reader: impl AsyncRead + Send + Unpin + 'static,
     destination: &Path,
 ) -> Result<ExtractResult, ExtractError> {
@@ -246,6 +255,174 @@ pub async fn extract_wheel_via_buffering(
     tokio::fs::create_dir_all(destination)
         .await
         .map_err(ExtractError::CouldNotCreateDestination)?;
+
+    // Clone destination for the async block
+    let destination = destination.to_owned();
+
+    // Wrap the reading in additional readers that will compute the hashes while extracting
+    let sha256_reader = rattler_digest::HashingReader::<_, rattler_digest::Sha256>::new(reader);
+    let mut md5_reader =
+        rattler_digest::HashingReader::<_, rattler_digest::Md5>::new(sha256_reader);
+    let mut size_reader = SizeCountingReader::new(&mut md5_reader);
+
+    // Convert to futures traits and create a buffered reader (async_zip uses futures traits)
+    let compat_reader = (&mut size_reader).compat();
+    let mut buf_reader = futures::io::BufReader::with_capacity(DEFAULT_BUF_SIZE, compat_reader);
+
+    // Create a ZIP reader for streaming
+    let mut zip_reader = ZipFileReader::new(&mut buf_reader);
+
+    // Records, for every non-directory entry we've written, its local-header
+    // file offset -> destination path, so that we can look up and fix up
+    // executable bits once we reach the matching central-directory entry.
+    // Only needed on Unix, where executable bits are meaningful.
+    #[cfg(unix)]
+    let mut offset_to_path: std::collections::HashMap<u64, std::path::PathBuf> =
+        std::collections::HashMap::new();
+
+    let mut offset = 0u64;
+    while let Some(mut entry) = zip_reader
+        .next_with_entry()
+        .await
+        .map_err(|e| ExtractError::IoError(std::io::Error::other(e)))?
+    {
+        let zip_entry = entry.reader().entry();
+        let filename = zip_entry.filename().as_str().map_err(|e| {
+            ExtractError::IoError(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
+        let is_dir = zip_entry.dir().unwrap_or(false);
+        let file_offset = zip_entry.file_offset();
+
+        let Some(relpath) = super::shared::sanitize_zip_entry_name(filename) else {
+            tracing::warn!("skipping unsafe wheel entry path: {filename}");
+            (.., zip_reader) = entry
+                .skip()
+                .await
+                .map_err(|e| ExtractError::IoError(std::io::Error::other(e)))?;
+            offset = zip_reader.offset();
+            continue;
+        };
+        let out_path = destination.join(
+            rattler_conda_types::package::wheel::map_wheel_archive_path(&relpath),
+        );
+
+        if is_dir {
+            tokio::fs::create_dir_all(&out_path)
+                .await
+                .map_err(ExtractError::IoError)?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(ExtractError::IoError)?;
+            }
+
+            let mut out_file = tokio::fs::File::create(&out_path)
+                .await
+                .map_err(ExtractError::IoError)?;
+            let mut compat_entry = entry.reader_mut().compat();
+            tokio::io::copy(&mut compat_entry, &mut out_file)
+                .await
+                .map_err(ExtractError::IoError)?;
+
+            #[cfg(unix)]
+            offset_to_path.insert(file_offset, out_path);
+        }
+
+        // Skip to the next entry (required by async_zip API)
+        (.., zip_reader) = entry
+            .skip()
+            .await
+            .map_err(|e| ExtractError::IoError(std::io::Error::other(e)))?;
+        offset = zip_reader.offset();
+    }
+
+    // Central-directory pass (Unix only): recover executable bits, which
+    // live in the central directory's external file attributes rather than
+    // the local file headers we've just streamed through. The streaming
+    // `ZipFileReader` stops right at the start of the central directory, so
+    // we continue reading from there.
+    #[cfg(unix)]
+    {
+        use async_zip::base::read::cd::{CentralDirectoryReader, Entry};
+
+        let mut directory = CentralDirectoryReader::new(&mut buf_reader, offset);
+        loop {
+            match directory.next().await {
+                Ok(Entry::CentralDirectoryEntry(entry)) => {
+                    if let Some(path) = offset_to_path.get(&entry.file_offset()) {
+                        super::shared::apply_executable_bit(entry.unix_permissions(), path).await?;
+                    }
+                }
+                Ok(Entry::EndOfCentralDirectoryRecord { .. }) => break,
+                Err(e) => {
+                    // Best-effort: the archive has already been fully
+                    // extracted above; failing to parse the central
+                    // directory just means we lose executable-bit fixups.
+                    tracing::warn!(
+                        "failed to read wheel central directory for executable-bit fixup: {e}"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    // Read any remaining data to ensure the hash is properly computed.
+    futures::io::copy(&mut buf_reader, &mut futures::io::sink())
+        .await
+        .map_err(ExtractError::IoError)?;
+
+    // Get the size and hashes
+    let (_, total_size) = size_reader.finalize();
+    let (sha256_reader, md5) = md5_reader.finalize();
+    let (_, sha256) = sha256_reader.finalize();
+
+    // Validate that we actually read some data from the stream
+    if total_size == 0 {
+        return Err(ExtractError::IoError(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "no data was read from the package stream - the stream may have been truncated",
+        )));
+    }
+
+    Ok(ExtractResult {
+        sha256,
+        md5,
+        total_size,
+    })
+}
+
+/// Extracts the contents of a wheel (`.whl`) archive by fully reading the
+/// stream and then extracting via the seek-based API. This is a fallback
+/// method for when streaming (see [`extract_wheel`]) fails, e.g. due to zip
+/// data descriptors that are incompatible with streaming decompression.
+///
+/// Like [`extract_conda_via_buffering`], this uses a [`SpooledTempFile`]
+/// (5MB in-memory threshold, spilling to a real temporary file on disk
+/// beyond that) rather than an unconditional in-memory buffer, so this
+/// scales gracefully to the very large wheels shipped by some compiled
+/// packages.
+pub async fn extract_wheel_via_buffering(
+    reader: impl AsyncRead + Send + Unpin + 'static,
+    destination: &Path,
+) -> Result<ExtractResult, ExtractError> {
+    // Delete destination first if it exists, as this method is usually used as a fallback
+    if tokio::fs::try_exists(destination)
+        .await
+        .map_err(ExtractError::IoError)?
+    {
+        tokio::fs::remove_dir_all(destination)
+            .await
+            .map_err(ExtractError::CouldNotCreateDestination)?;
+    }
+
+    // Ensure the destination directory exists
+    tokio::fs::create_dir_all(destination)
+        .await
+        .map_err(ExtractError::CouldNotCreateDestination)?;
+
+    // Clone destination for the async block
     let destination = destination.to_owned();
 
     // Wrap the reading in additional readers that will compute the hashes while
@@ -255,16 +432,20 @@ pub async fn extract_wheel_via_buffering(
         rattler_digest::HashingReader::<_, rattler_digest::Md5>::new(sha256_reader);
     let mut size_reader = SizeCountingReader::new(&mut md5_reader);
 
-    let mut buffer = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut size_reader, &mut buffer)
+    // Create a SpooledTempFile (uses memory up to 5MB, then switches to disk)
+    let mut spooled_file = SpooledTempFile::new(5 * 1024 * 1024);
+
+    // Copy from reader to spooled file while computing hashes
+    tokio::io::copy(&mut size_reader, &mut spooled_file)
         .await
         .map_err(ExtractError::IoError)?;
 
-    // Get the size and hashes
+    // Get the size and hashes now that we've read everything
     let (_, total_size) = size_reader.finalize();
     let (sha256_reader, md5) = md5_reader.finalize();
     let (_, sha256) = sha256_reader.finalize();
 
+    // Validate that we actually read some data from the stream
     if total_size == 0 {
         return Err(ExtractError::IoError(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -272,16 +453,11 @@ pub async fn extract_wheel_via_buffering(
         )));
     }
 
-    tokio::task::spawn_blocking(move || {
-        crate::seek::extract_wheel_contents(std::io::Cursor::new(buffer), &destination)
-    })
-    .await
-    .map_err(|err| {
-        if let Ok(reason) = err.try_into_panic() {
-            std::panic::resume_unwind(reason);
-        }
-        ExtractError::Cancelled
-    })??;
+    // Rewind the spooled file to the beginning
+    spooled_file.rewind().await.map_err(ExtractError::IoError)?;
+
+    // Use the seek-based extraction (doesn't recompute hashes, we already have them)
+    crate::tokio::async_seek::extract_wheel(spooled_file, &destination).await?;
 
     Ok(ExtractResult {
         sha256,
@@ -314,4 +490,120 @@ pub(crate) async fn get_file_from_tar_archive<R: tokio::io::AsyncRead + Unpin>(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod test {
+    use std::io::Write;
+
+    use super::{extract_wheel, extract_wheel_via_buffering};
+
+    /// Builds a minimal, but structurally realistic, wheel archive, with an
+    /// executable bit set on the `.data/scripts/` entry (as a real console
+    /// script binary shipped by a compiled wheel would have), to exercise
+    /// the central-directory permission-fixup logic.
+    fn build_test_wheel(path: &std::path::Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+
+        zip.start_file("demo.py", options).unwrap();
+        zip.write_all(b"print('hello')\n").unwrap();
+
+        zip.start_file("demo-1.0.dist-info/RECORD", options)
+            .unwrap();
+        zip.write_all(b"demo.py,sha256=,16\ndemo-1.0.dist-info/RECORD,,\n")
+            .unwrap();
+
+        // A raw, pre-built executable shipped in `.data/scripts/`, as some
+        // compiled wheels do (e.g. Rust/Go binaries), with the executable
+        // bit set in the zip's central directory metadata.
+        zip.start_file(
+            "demo-1.0.data/scripts/demo-native-cli",
+            options.unix_permissions(0o755),
+        )
+        .unwrap();
+        zip.write_all(b"\0ELF-ish-binary-stand-in").unwrap();
+
+        zip.start_file("demo-1.0.data/platlib/_demo_native.so", options)
+            .unwrap();
+        zip.write_all(b"not-really-a-shared-library").unwrap();
+
+        zip.finish().unwrap();
+    }
+
+    async fn open(path: &std::path::Path) -> tokio::fs::File {
+        tokio::fs::File::open(path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_extract_wheel_streaming_remaps_paths_and_preserves_exec_bit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wheel_path = temp_dir.path().join("demo-1.0-py3-none-any.whl");
+        build_test_wheel(&wheel_path);
+
+        let destination = temp_dir.path().join("extracted");
+        let result = extract_wheel(open(&wheel_path).await, &destination)
+            .await
+            .unwrap();
+        assert!(result.total_size > 0);
+
+        assert!(destination.join("site-packages/demo.py").is_file());
+        assert!(
+            destination
+                .join("site-packages/demo-1.0.dist-info/RECORD")
+                .is_file()
+        );
+        // `.data/scripts/` maps to `python-scripts/`.
+        let script_path = destination.join("python-scripts/demo-native-cli");
+        assert!(script_path.is_file());
+        // `.data/platlib/` (compiled/subdir-specific content) maps to `site-packages/`.
+        assert!(destination.join("site-packages/_demo_native.so").is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&script_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o111,
+                0o111,
+                "executable bit should have been recovered from the central directory"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extract_wheel_via_buffering_remaps_paths_and_preserves_exec_bit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wheel_path = temp_dir.path().join("demo-1.0-py3-none-any.whl");
+        build_test_wheel(&wheel_path);
+
+        let destination = temp_dir.path().join("extracted");
+        let result = extract_wheel_via_buffering(open(&wheel_path).await, &destination)
+            .await
+            .unwrap();
+        assert!(result.total_size > 0);
+
+        assert!(destination.join("site-packages/demo.py").is_file());
+        let script_path = destination.join("python-scripts/demo-native-cli");
+        assert!(script_path.is_file());
+        assert!(destination.join("site-packages/_demo_native.so").is_file());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&script_path)
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                mode & 0o111,
+                0o111,
+                "executable bit should have been preserved by the seek-based fallback"
+            );
+        }
+    }
 }

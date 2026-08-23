@@ -225,12 +225,52 @@ pub async fn extract_wheel(
     expected_sha256: Option<Sha256Hash>,
     reporter: Option<Arc<dyn DownloadReporter>>,
 ) -> Result<ExtractResult, ExtractError> {
-    let reader = get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
-    let result = crate::tokio::async_read::extract_wheel_via_buffering(reader, destination).await?;
-    if let Some(reporter) = &reporter {
-        reporter.on_download_complete();
+    let reader = get_reader(
+        url.clone(),
+        client.clone(),
+        expected_sha256,
+        reporter.clone(),
+    )
+    .await?;
+    match crate::tokio::async_read::extract_wheel(reader, destination).await {
+        Ok(result) => {
+            if let Some(reporter) = &reporter {
+                reporter.on_download_complete();
+            }
+            Ok(result)
+        }
+        // Some wheels use zip data descriptors in a way that's incompatible with
+        // streaming decompression (the same condition `.conda` extraction can hit,
+        // see https://github.com/conda/rattler/issues/794). Fall back to fully
+        // buffering the archive (to disk, beyond a small in-memory threshold, not
+        // unconditionally in memory) and extracting via the seek-based API.
+        Err(ExtractError::ZipError(ZipError::UnsupportedArchive(zip_error)))
+            if (zip_error.contains(DATA_DESCRIPTOR_ERROR_MESSAGE)) =>
+        {
+            tracing::warn!(
+                "Failed to stream decompress wheel from '{}' due to the presence of zip data descriptors. Falling back to non streaming decompression",
+                url
+            );
+            if let Some(reporter) = &reporter {
+                reporter.on_download_complete();
+            }
+            let new_reader =
+                get_reader(url.clone(), client, expected_sha256, reporter.clone()).await?;
+
+            match crate::tokio::async_read::extract_wheel_via_buffering(new_reader, destination)
+                .await
+            {
+                Ok(result) => {
+                    if let Some(reporter) = &reporter {
+                        reporter.on_download_complete();
+                    }
+                    Ok(result)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
     }
-    Ok(result)
 }
 
 /// Extracts the contents a package archive from the specified remote location.

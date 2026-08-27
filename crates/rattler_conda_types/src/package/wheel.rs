@@ -347,6 +347,40 @@ fn parse_record_hash(field: &str) -> Option<Sha256Hash> {
     rattler_digest::parse_digest_from_hex::<rattler_digest::Sha256>(&hex_str)
 }
 
+/// Formats a `RECORD` hash field (e.g. `sha256=<url-safe base64, no
+/// padding>`) from a [`Sha256Hash`] - the inverse of [`parse_record_hash`].
+fn format_record_hash(hash: &Sha256Hash) -> String {
+    format!(
+        "sha256={}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.as_slice())
+    )
+}
+
+/// Quotes a `RECORD` path field per [PEP 376](https://peps.python.org/pep-0376/)'s
+/// CSV format (matching `csv.writer`'s quoting rules, as used by `pip`), i.e.
+/// wraps the field in `"..."` and doubles any embedded `"` if it contains a
+/// character (`,`, `"`, or a line break) that would otherwise be ambiguous in
+/// a comma-separated line.
+fn quote_record_field(field: &str) -> String {
+    if field.contains(['"', ',', '\n', '\r']) {
+        format!("\"{}\"", field.replace('"', "\"\""))
+    } else {
+        field.to_string()
+    }
+}
+
+/// Formats a single `RECORD` line - the inverse of the per-line parsing in
+/// [`WheelRecord::parse`] - for `path` (already resolved to the path that
+/// should be recorded, i.e. relative to the `.dist-info` directory's parent,
+/// using forward slashes) together with its optional hash and size. Passing
+/// `hash: None` produces an empty hash field, as `RECORD` conventionally
+/// does for its own self-entry (see [`WheelRecordEntry::sha256`]'s docs).
+pub fn format_record_line(path: &str, hash: Option<&Sha256Hash>, size: Option<u64>) -> String {
+    let hash_field = hash.map(format_record_hash).unwrap_or_default();
+    let size_field = size.map(|size| size.to_string()).unwrap_or_default();
+    format!("{},{},{}", quote_record_field(path), hash_field, size_field)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -432,6 +466,30 @@ mod test {
         );
         assert_eq!(parsed.entries[1].sha256, None);
         assert_eq!(parsed.entries[1].size, None);
+    }
+
+    #[test]
+    fn test_format_record_line_roundtrips_through_parse() {
+        let line = "six.py,sha256=oVfM8HHRJHtSpvT6H9nCwXlH0Br1nhIQyfmAvxSHu9c,34547";
+        let parsed = WheelRecord::parse(line).unwrap();
+        let entry = &parsed.entries[0];
+        assert_eq!(
+            format_record_line("six.py", entry.sha256.as_ref(), entry.size),
+            line
+        );
+    }
+
+    #[test]
+    fn test_format_record_line_empty_hash_and_size() {
+        assert_eq!(
+            format_record_line("six-1.9.0.dist-info/RECORD", None, None),
+            "six-1.9.0.dist-info/RECORD,,"
+        );
+    }
+
+    #[test]
+    fn test_format_record_line_quotes_path_with_comma() {
+        assert_eq!(format_record_line("a,b.py", None, Some(3)), "\"a,b.py\",,3");
     }
 
     #[test]

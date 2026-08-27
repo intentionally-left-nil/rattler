@@ -45,6 +45,7 @@ memchr = { workspace = true }
 memmap2 = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
+pathdiff = { workspace = true }
 rattler_cache = { workspace = true }
 rattler_conda_types = { workspace = true }
 rattler_config = { workspace = true, optional = true, default-features = false }

@@ -349,26 +349,59 @@ pub fn link_wheel_sync(
         .unwrap_or_else(|| target_dir.path().to_path_buf());
     let platform = options.platform.unwrap_or(Platform::current());
 
-    let (paths, link_type) =
+    let (mut paths, link_type) =
         super::link_package_sync(cached_wheel_dir, target_dir, clobber_registry, options)
             .map_err(WheelInstallError::Install)?;
 
-    // Rewrite any `#!python`/`#!pythonw` placeholder shebang (see the wheel
-    // spec's "scripts" category) to point at the real interpreter. Shebangs
-    // are a Unix-only execution mechanism, so there is nothing to do on
-    // Windows (where `.data/scripts/` content without a matching
-    // `console_scripts`/`gui_scripts` entry point is not made executable by
-    // any installer, rattler included).
-    if let Some(python_info) = &python_info
-        && platform.is_unix()
-    {
-        let target_prefix = target_prefix
-            .to_str()
-            .ok_or(InstallError::TargetPrefixIsNotUtf8)?;
-        fix_up_script_shebangs(&wheel_record, target_dir, python_info, target_prefix)?;
+    if let Some(python_info) = &python_info {
+        // Rewrite any `#!python`/`#!pythonw` placeholder shebang (see the
+        // wheel spec's "scripts" category) to point at the real
+        // interpreter. Shebangs are a Unix-only execution mechanism, so
+        // there is nothing to do on Windows (where `.data/scripts/` content
+        // without a matching `console_scripts`/`gui_scripts` entry point is
+        // not made executable by any installer, rattler included).
+        if platform.is_unix() {
+            let target_prefix = target_prefix
+                .to_str()
+                .ok_or(InstallError::TargetPrefixIsNotUtf8)?;
+            fix_up_script_shebangs(&wheel_record, target_dir, python_info, target_prefix)?;
+        }
+
+        // Make the installed wheel legible to pip-compatible tooling
+        // (`pip list`/`pip uninstall`, `importlib.metadata`, `uv`, ...) run
+        // against the environment from outside rattler: rewrite `RECORD` so
+        // its paths reflect where files actually ended up (rather than the
+        // wheel-archive-relative paths it shipped with), and write an
+        // `INSTALLER` file, exactly as `pip` itself would.
+        rewrite_record_and_write_installer(&wheel_record, target_dir, python_info, &mut paths)?;
     }
 
+    paths.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+
     Ok((paths, link_type))
+}
+
+/// Returns the path of `archive_path` (a wheel-archive-relative path, as it
+/// appears in the wheel's own `RECORD`) relative to the environment prefix
+/// root, after applying the `site-packages`/`python-scripts` remapping (see
+/// [`map_wheel_archive_path`]).
+fn wheel_prefix_relative_path(archive_path: &Path, python_info: &PythonInfo) -> PathBuf {
+    python_info
+        .get_python_noarch_target_path(&map_wheel_archive_path(archive_path))
+        .into_owned()
+}
+
+/// Returns the absolute install-time destination of `archive_path` (a
+/// wheel-archive-relative path) under `target_dir`. See
+/// [`wheel_prefix_relative_path`].
+fn wheel_install_path(
+    archive_path: &Path,
+    target_dir: &Prefix,
+    python_info: &PythonInfo,
+) -> PathBuf {
+    target_dir
+        .path()
+        .join(wheel_prefix_relative_path(archive_path, python_info))
 }
 
 /// Rewrites every `.data/scripts/` entry's placeholder shebang (see
@@ -383,13 +416,195 @@ fn fix_up_script_shebangs(
         if !is_wheel_script_path(&entry.archive_path) {
             continue;
         }
-        let mapped = map_wheel_archive_path(&entry.archive_path);
-        let destination = target_dir
-            .path()
-            .join(python_info.get_python_noarch_target_path(&mapped));
+        let destination = wheel_install_path(&entry.archive_path, target_dir, python_info);
         rewrite_wheel_script_shebang(&destination, python_info, target_prefix)?;
     }
     Ok(())
+}
+
+/// Locates the `.dist-info` directory (as an archive-relative path, e.g.
+/// `demo-1.0.dist-info`) by finding `RECORD`'s own self-entry - every valid
+/// wheel `RECORD` lists itself (see [the wheel
+/// spec](https://packaging.python.org/en/latest/specifications/recording-installed-packages/)),
+/// conventionally with an empty hash/size (see
+/// [`rattler_conda_types::package::wheel::WheelRecordEntry::sha256`]'s docs).
+fn find_dist_info_archive_dir(wheel_record: &WheelRecord) -> Result<PathBuf, WheelInstallError> {
+    wheel_record
+        .entries
+        .iter()
+        .find_map(|entry| {
+            let parent = entry.archive_path.parent()?;
+            let is_record = entry.archive_path.file_name()?.to_str()? == "RECORD";
+            let parent_is_dist_info = parent
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".dist-info"));
+            (is_record && parent_is_dist_info).then(|| parent.to_path_buf())
+        })
+        .ok_or_else(|| {
+            WheelInstallError::FailedToReadRecord(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "wheel's RECORD does not list its own 'RECORD' entry inside a '*.dist-info' \
+                 directory",
+            ))
+        })
+}
+
+/// Makes an installed wheel legible to pip-compatible tooling run against
+/// the environment from *outside* rattler - a bare `pip list`/`pip
+/// uninstall`, `importlib.metadata.files()`, or `uv` invocation that has no
+/// idea (and has no reason to care) that the package was installed via
+/// rattler rather than `pip` itself.
+///
+/// Concretely, this:
+///
+/// * Rewrites the installed `RECORD` file so every entry's path is relative
+///   to the environment's `site-packages` directory (the wheel `purelib`
+///   scheme dir - this is the base `pip` itself uses; verified against a
+///   real `pip`-installed `RECORD`, whose purelib entries such as
+///   `pip/__init__.py` carry no `../` even though `RECORD` lives one level
+///   deeper, inside `pip-<version>.dist-info/`) and reflects where the file
+///   was *actually* installed, instead of the wheel-archive-relative path it
+///   shipped with. Wheel content that never moves relative to
+///   `site-packages` (plain `purelib`/`platlib`/root files) happens to
+///   round-trip correctly even without this, since the archive-relative
+///   path *is* already the site-packages-relative path - but anything
+///   installed elsewhere (`.data/scripts/`, `.data/data/`, ...) does not:
+///   the wheel's own `RECORD` was written by whoever built the wheel, long
+///   before it knew rattler's install-time layout, so left unrewritten it
+///   would point at paths that were never created.
+/// * Writes an `INSTALLER` file containing `rattler\n`, exactly as `pip`
+///   writes `pip\n` (some tooling uses this file to tell which tool manages
+///   a given distribution).
+///
+/// `paths` is updated in place to keep it consistent with what is actually
+/// on disk: `RECORD`'s already-tracked entry has its hash/size refreshed to
+/// match the rewritten content, and a new entry for `INSTALLER` is appended
+/// so it is tracked for uninstall like every other wheel-owned file.
+fn rewrite_record_and_write_installer(
+    wheel_record: &WheelRecord,
+    target_dir: &Prefix,
+    python_info: &PythonInfo,
+    paths: &mut Vec<prefix_record::PathsEntry>,
+) -> Result<(), WheelInstallError> {
+    let dist_info_archive_dir = find_dist_info_archive_dir(wheel_record)?;
+    let dist_info_dir = wheel_install_path(&dist_info_archive_dir, target_dir, python_info);
+    let site_packages_dir = target_dir.path().join(&python_info.site_packages_path);
+
+    let installer_content: &[u8] = b"rattler\n";
+    let installer_hash =
+        rattler_digest::compute_bytes_digest::<rattler_digest::Sha256>(installer_content);
+    let installer_size = installer_content.len() as u64;
+
+    let mut record_content = String::new();
+    for entry in &wheel_record.entries {
+        let install_path = wheel_install_path(&entry.archive_path, target_dir, python_info);
+        // Relative to `site-packages`, matching the convention real-world
+        // `pip`-written `RECORD` files use (verified against an actual
+        // `pip`-installed environment): entries outside `site-packages`
+        // (e.g. scripts) end up with a `../`-prefixed path that walks back
+        // up to the environment root and back down again.
+        let record_relative = pathdiff::diff_paths(&install_path, &site_packages_dir)
+            .unwrap_or_else(|| install_path.clone());
+        let record_relative = path_to_record_string(&record_relative);
+        record_content.push_str(&rattler_conda_types::package::wheel::format_record_line(
+            &record_relative,
+            entry.sha256.as_ref(),
+            entry.size,
+        ));
+        record_content.push('\n');
+    }
+    // `INSTALLER` is a new file, not part of the wheel's own `RECORD`
+    // entries, but a real `pip`-written `RECORD` tracks its own `INSTALLER`
+    // line too (with a real hash/size, unlike `RECORD`'s own self-entry), so
+    // ours does the same.
+    let installer_record_relative = {
+        let relative = pathdiff::diff_paths(dist_info_dir.join("INSTALLER"), &site_packages_dir)
+            .unwrap_or_else(|| dist_info_dir.join("INSTALLER"));
+        path_to_record_string(&relative)
+    };
+    record_content.push_str(&rattler_conda_types::package::wheel::format_record_line(
+        &installer_record_relative,
+        Some(&installer_hash),
+        Some(installer_size),
+    ));
+    record_content.push('\n');
+
+    let (record_hash, record_size) =
+        rewrite_file_via_tempfile(&dist_info_dir.join("RECORD"), record_content.as_bytes())?;
+    rewrite_file_via_tempfile(&dist_info_dir.join("INSTALLER"), installer_content)?;
+
+    let record_prefix_relative =
+        wheel_prefix_relative_path(&dist_info_archive_dir.join("RECORD"), python_info);
+    if let Some(record_entry) = paths
+        .iter_mut()
+        .find(|entry| entry.relative_path == record_prefix_relative)
+    {
+        // `RECORD`'s own entry never carries a declared hash (see
+        // `WheelRecordEntry::sha256`'s docs), so `sha256_in_prefix` -
+        // "differs from the declared/tracked hash" - is the right field to
+        // set here, mirroring how the generic linker already tracks this
+        // for every other linked file (see `crate::install::mod::link_package_sync`).
+        record_entry.sha256_in_prefix = Some(record_hash);
+        record_entry.size_in_bytes = Some(record_size);
+    }
+
+    paths.push(prefix_record::PathsEntry {
+        relative_path: wheel_prefix_relative_path(
+            &dist_info_archive_dir.join("INSTALLER"),
+            python_info,
+        ),
+        original_path: None,
+        path_type: prefix_record::PathType::PipInstallerMetadata,
+        no_link: false,
+        sha256: Some(installer_hash),
+        sha256_in_prefix: None,
+        size_in_bytes: Some(installer_size),
+        prefix_placeholder: None,
+        file_mode: None,
+    });
+
+    Ok(())
+}
+
+/// Formats `path` (typically the output of [`pathdiff::diff_paths`]) as a
+/// `RECORD`-style, forward-slash-separated string, regardless of platform -
+/// matching the wheel archive path convention (`RECORD` always uses `/`,
+/// even on Windows).
+fn path_to_record_string(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Writes `contents` to `path` via a temp-file-then-rename - mirroring
+/// [`rewrite_wheel_script_shebang`] - so that a hardlinked (shared-inode)
+/// cache entry (as `RECORD` is, before this rewrite) is never mutated in
+/// place, and returns the sha256 hash and size of what was written.
+fn rewrite_file_via_tempfile(
+    path: &Path,
+    contents: &[u8],
+) -> Result<(rattler_digest::Sha256Hash, u64), WheelInstallError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".rattler-wheel-record-fixup")
+        .tempfile_in(parent)
+        .map_err(WheelInstallError::Io)?;
+    temp.write_all(contents).map_err(WheelInstallError::Io)?;
+    // Preserve the destination's existing permissions, if any (e.g.
+    // `RECORD`, which was already linked from the cache and may have had
+    // its permissions patched by the generic linker); `INSTALLER` is brand
+    // new and simply gets the temp file's (umask-derived) default
+    // permissions, same as `pip` creating it for the first time.
+    if let Ok(metadata) = fs_err::metadata(path) {
+        temp.as_file()
+            .set_permissions(metadata.permissions())
+            .map_err(WheelInstallError::Io)?;
+    }
+    temp.persist(path)
+        .map_err(|e| WheelInstallError::Io(e.error))?;
+    let hash = rattler_digest::compute_bytes_digest::<rattler_digest::Sha256>(contents);
+    Ok((hash, contents.len() as u64))
 }
 
 /// Rewrites a `#!python`/`#!pythonw` placeholder shebang - the convention
@@ -699,9 +914,10 @@ mod test {
                 .is_none()
         );
         // Every wheel-owned file should be tracked for uninstall/listing: the
-        // 6 files listed in `RECORD` plus the generated `demo-cli` entry
-        // point script (1 file on unix, 2 on windows).
-        let expected_paths = if cfg!(windows) { 8 } else { 7 };
+        // 6 files listed in `RECORD`, plus the generated `demo-cli` entry
+        // point script (1 file on unix, 2 on windows), plus the `INSTALLER`
+        // file written for pip-interoperability (see below).
+        let expected_paths = if cfg!(windows) { 9 } else { 8 };
         assert_eq!(installed_record.paths_data.paths.len(), expected_paths);
 
         let python_info = PythonInfo::from_version(
@@ -789,6 +1005,81 @@ mod test {
         assert!(extraction_dir.join("demo-1.0.dist-info/RECORD").is_file());
         assert!(!extraction_dir.join("site-packages").exists());
 
+        // --- Pip interoperability: `RECORD` and `INSTALLER` ---
+        //
+        // A bare `pip list`/`pip uninstall`/`importlib.metadata.files()` (or
+        // `uv`) run against this environment, with no idea the package was
+        // installed via rattler, must be able to find every file exactly
+        // where `RECORD` says it is - not just the ones that happen to stay
+        // in `site-packages`.
+        let site_packages_dir = prefix_dir.join(&python_info.site_packages_path);
+        let dist_info_dir = site_packages_dir.join("demo-1.0.dist-info");
+
+        let installer_path = dist_info_dir.join("INSTALLER");
+        assert!(installer_path.is_file(), "INSTALLER should be written");
+        assert_eq!(
+            std::fs::read_to_string(&installer_path).unwrap(),
+            "rattler\n"
+        );
+
+        let record_content = std::fs::read_to_string(dist_info_dir.join("RECORD")).unwrap();
+        let record_paths: Vec<&str> = record_content
+            .lines()
+            .map(|line| line.split(',').next().unwrap())
+            .collect();
+        // Every entry's path, resolved relative to `site-packages` (exactly
+        // how `pip`/`importlib.metadata` resolve `RECORD` - verified against
+        // a real `pip`-installed environment), must exist on disk. This is
+        // the actual bug being fixed: previously `RECORD` kept the
+        // wheel-archive-relative paths verbatim, which are wrong for
+        // anything that isn't a plain root/purelib file.
+        for record_path in &record_paths {
+            let resolved = site_packages_dir.join(record_path);
+            assert!(
+                resolved.is_file(),
+                "RECORD entry '{record_path}' should resolve to a real, installed file at \
+                 {resolved:?}"
+            );
+        }
+        // `INSTALLER` itself must be tracked in `RECORD` too, just like a
+        // real `pip`-written `RECORD` tracks it.
+        assert!(
+            record_paths.contains(&"demo-1.0.dist-info/INSTALLER"),
+            "RECORD should list the INSTALLER file it just wrote, got: {record_paths:?}"
+        );
+        // The wheel's own root-level file, and the `.data/platlib` file,
+        // need no `../` (neither ever moves relative to `site-packages`),
+        // but the relocated `.data/scripts` entry does - this is what
+        // would have been wrong (pointing at a non-existent
+        // `demo-1.0.data/...` path) before this fix.
+        assert!(record_paths.contains(&"demo.py"));
+        assert!(
+            record_paths
+                .iter()
+                .any(|p| p.starts_with("..") && p.ends_with("demo-data-script")),
+            "the relocated .data/scripts entry should be recorded relative to site-packages, \
+             got: {record_paths:?}"
+        );
+        assert!(
+            record_paths.contains(&"_demo_native.so"),
+            "the relocated .data/platlib entry lands right in site-packages, so needs no \
+             '../', got: {record_paths:?}"
+        );
+        // `RECORD`'s own tracked hash/size were refreshed to match the
+        // rewritten content (it is no longer the verbatim, hash-less cache
+        // copy).
+        let record_entry = installed_record
+            .paths_data
+            .paths
+            .iter()
+            .find(|p| p.relative_path.ends_with("demo-1.0.dist-info/RECORD"))
+            .expect("RECORD should be tracked");
+        assert!(record_entry.sha256_in_prefix.is_some());
+        assert_eq!(
+            record_entry.size_in_bytes,
+            Some(record_content.len() as u64)
+        );
+
         // --- Uninstall ---
         let result = Installer::new()
             .with_wheel_cache_dir(temp_dir.path().join("wheel-cache"))
@@ -818,6 +1109,10 @@ mod test {
                 .join(&python_info.bin_dir)
                 .join("demo-data-script")
                 .exists()
+        );
+        assert!(
+            !installer_path.exists(),
+            "INSTALLER should have been removed on uninstall too"
         );
     }
 

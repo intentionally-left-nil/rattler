@@ -4900,6 +4900,7 @@ dependencies = [
  "openidconnect",
  "parking_lot",
  "path_resolver",
+ "pathdiff",
  "rand 0.10.2",
  "rattler_cache",
  "rattler_conda_types",

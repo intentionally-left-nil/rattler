@@ -146,6 +146,15 @@ pub enum PathType {
     /// Python script file) Entry points are created in the `bin/...`
     /// directory when installing Python noarch packages
     UnixPythonEntryPoint,
+    /// A pip-interoperability metadata file (currently only `INSTALLER`)
+    /// generated at install time for a wheel-origin package, rather than
+    /// linked from its own archive contents - see
+    /// `crate::package::wheel`/`rattler::install::wheel` for how wheels are
+    /// installed. This lets pip-compatible tooling run against the
+    /// environment from outside rattler (`pip list`/`pip uninstall`,
+    /// `importlib.metadata`, `uv`, ...) recognize that the package was
+    /// installed by a tool other than `pip` itself.
+    PipInstallerMetadata,
     /// NOT USED - path to the package's .json file in conda-meta
     LinkedPackageRecord,
 }

@@ -33,6 +33,7 @@ pub mod wheel;
 #[cfg(unix)]
 use std::sync::OnceLock;
 use std::{
+    borrow::Cow,
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet, binary_heap::PeekMut},
     fs,
@@ -259,6 +260,20 @@ pub struct InstallOptions {
     /// Some packages (e.g. driver packages) legitimately ship symlinks to paths
     /// outside the environment.
     pub external_symlink_policy: ExternalSymlinkPolicy,
+
+    /// Whether the package being linked is a Python wheel (see
+    /// [`crate::install::wheel`]), rather than a regular conda package.
+    ///
+    /// Wheels are cached as a faithful, archive-relative unpack (the same
+    /// layout `unzip` would produce), *not* remapped onto the
+    /// `site-packages`/`python-scripts` install convention the way a conda
+    /// `noarch: python` package's own `info/paths.json` already is. When
+    /// this is set, [`compute_paths`] applies that remapping (see
+    /// [`rattler_conda_types::package::wheel::map_wheel_archive_path`])
+    /// before resolving each entry's install-time destination, instead of
+    /// assuming the `relative_path` is already in the noarch-python
+    /// convention.
+    pub is_wheel: bool,
 }
 
 /// Controls the behavior when a symlink target escapes the target prefix.
@@ -362,7 +377,12 @@ pub async fn link_package(
     let platform = options.platform.unwrap_or(Platform::current());
 
     // compute all path renames
-    let final_paths = compute_paths(&index_json, &paths_json, options.python_info.as_ref());
+    let final_paths = compute_paths(
+        &index_json,
+        &paths_json,
+        options.python_info.as_ref(),
+        options.is_wheel,
+    );
 
     // register all paths in the install driver path registry
     let clobber_paths = Arc::new(
@@ -713,7 +733,12 @@ pub fn link_package_sync(
     let platform = options.platform.unwrap_or(Platform::current());
 
     // compute all path renames
-    let final_paths = compute_paths(&index_json, &paths_json, options.python_info.as_ref());
+    let final_paths = compute_paths(
+        &index_json,
+        &paths_json,
+        options.python_info.as_ref(),
+        options.is_wheel,
+    );
 
     // register all paths in the install driver path registry
     let clobber_paths = clobber_registry
@@ -1018,13 +1043,29 @@ fn compute_paths(
     index_json: &IndexJson,
     paths_json: &PathsJson,
     python_info: Option<&PythonInfo>,
+    is_wheel: bool,
 ) -> Vec<(rattler_conda_types::package::PathsEntry, PathBuf)> {
     let mut final_paths = Vec::with_capacity(paths_json.paths.len());
     for entry in &paths_json.paths {
         let path = if index_json.noarch.is_python() {
+            // A wheel's cache holds a faithful, archive-relative unpack
+            // (see `crate::install::wheel`), so `entry.relative_path` is
+            // still the *archive* path (e.g. `foo-1.0.data/scripts/foo-cli`)
+            // - unlike a conda `noarch: python` package, whose
+            // `info/paths.json` is already pre-arranged by conda-build into
+            // the `site-packages/`/`python-scripts/` convention that
+            // `get_python_noarch_target_path` expects. Apply that
+            // remapping here, first, so both cases end up on equal footing.
+            let noarch_relative_path = if is_wheel {
+                Cow::Owned(rattler_conda_types::package::wheel::map_wheel_archive_path(
+                    &entry.relative_path,
+                ))
+            } else {
+                Cow::Borrowed(&entry.relative_path)
+            };
             python_info
                 .unwrap()
-                .get_python_noarch_target_path(&entry.relative_path)
+                .get_python_noarch_target_path(&noarch_relative_path)
                 .to_path_buf()
         } else {
             entry.relative_path.clone()

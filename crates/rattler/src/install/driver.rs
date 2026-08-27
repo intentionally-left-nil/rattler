@@ -311,7 +311,17 @@ impl InstallDriver {
                 }
             }
 
-            let is_python_noarch = record.repodata_record.package_record.noarch.is_python();
+            // Wheels are always linked using the noarch-python convention
+            // internally (see `crate::install::wheel`), regardless of their
+            // own, real `noarch` - which is left untouched. Without this,
+            // uninstalling a wheel leaves an orphaned `__pycache__`-only
+            // directory tree behind, unlike an equivalent conda
+            // `noarch: python` package.
+            let is_python_noarch = record.repodata_record.package_record.noarch.is_python()
+                || matches!(
+                    record.repodata_record.identifier.archive_type,
+                    rattler_conda_types::package::DistArchiveType::Wheel(_)
+                );
 
             // Sort the directories by length, so that we delete the deepest directories
             // first.

@@ -41,9 +41,11 @@ pub fn extract_conda(archive: &Path, destination: &Path) -> Result<ExtractResult
 }
 
 /// Extracts the contents of a wheel (`.whl`) package archive at the specified
-/// path to a directory, remapping wheel-internal paths onto rattler's
-/// noarch-python install convention (see
-/// [`rattler_conda_types::package::wheel::map_wheel_archive_path`]).
+/// path to a directory, preserving the archive's original relative layout
+/// (i.e. the same layout `unzip` would produce). See the module-level
+/// documentation of [`rattler_conda_types::package::wheel`] for why the
+/// `site-packages`/`python-scripts` remapping used for installing wheels is
+/// deliberately not applied here.
 ///
 /// ```rust,no_run
 /// # use std::path::Path;
@@ -265,11 +267,10 @@ mod test {
     }
 
     /// Builds a minimal, but structurally realistic, wheel archive containing:
-    /// - a root-level module (maps to `site-packages/`)
+    /// - a root-level module
     /// - a `.dist-info/RECORD` and `.dist-info/entry_points.txt` (also root-level)
-    /// - a `.data/scripts/` file (maps to `python-scripts/`)
+    /// - a `.data/scripts/` file
     /// - a `.data/platlib/` file, simulating a compiled/subdir-specific wheel
-    ///   (also maps to `site-packages/`)
     fn build_test_wheel(path: &std::path::Path) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
@@ -300,7 +301,7 @@ mod test {
     }
 
     #[test]
-    fn test_extract_wheel_remaps_paths() {
+    fn test_extract_wheel_preserves_raw_archive_layout() {
         let temp_dir = tempfile::tempdir().unwrap();
         let wheel_path = temp_dir.path().join("demo-1.0-py3-none-any.whl");
         build_test_wheel(&wheel_path);
@@ -309,24 +310,25 @@ mod test {
         let result = extract_wheel(&wheel_path, &destination).unwrap();
         assert!(result.total_size > 0);
 
-        // Root-level files land under `site-packages/`.
-        assert!(destination.join("site-packages/demo.py").is_file());
+        // Every entry is extracted at its original, archive-relative path -
+        // no `site-packages`/`python-scripts` remapping is applied during
+        // extraction (that happens later, at install time).
+        assert!(destination.join("demo.py").is_file());
+        assert!(destination.join("demo-1.0.dist-info/RECORD").is_file());
         assert!(
             destination
-                .join("site-packages/demo-1.0.dist-info/RECORD")
+                .join("demo-1.0.dist-info/entry_points.txt")
                 .is_file()
         );
         assert!(
             destination
-                .join("site-packages/demo-1.0.dist-info/entry_points.txt")
+                .join("demo-1.0.data/scripts/demo-script")
                 .is_file()
         );
-
-        // `.data/scripts/` maps to `python-scripts/`.
-        assert!(destination.join("python-scripts/demo-script").is_file());
-
-        // `.data/platlib/` (compiled/subdir-specific content) also maps to
-        // `site-packages/`.
-        assert!(destination.join("site-packages/_demo_native.so").is_file());
+        assert!(
+            destination
+                .join("demo-1.0.data/platlib/_demo_native.so")
+                .is_file()
+        );
     }
 }

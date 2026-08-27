@@ -21,14 +21,15 @@ use futures::TryFutureExt;
 use itertools::Itertools;
 use parking_lot::Mutex;
 use rattler_conda_types::{
-    MatchSpec, PackageRecord, RepoDataRecord, package::CondaArchiveIdentifier,
+    MatchSpec, PackageRecord, RepoDataRecord,
+    package::{CondaArchiveIdentifier, IndexJson, PathsJson},
 };
 use rattler_digest::Sha256Hash;
 use rattler_networking::{
     LazyClient,
     retry_policies::{DoNotRetryPolicy, RetryDecision, RetryPolicy},
 };
-use rattler_package_streaming::{DownloadReporter, ExtractError};
+use rattler_package_streaming::{DownloadReporter, ExtractError, ExtractResult};
 use rattler_redaction::Redact;
 pub use reporter::CacheReporter;
 use simple_spawn_blocking::Cancelled;
@@ -65,6 +66,42 @@ pub struct PackageCacheLayer {
     packages: Arc<DashMap<BucketKey, Arc<tokio::sync::Mutex<Entry>>>>,
     validation_mode: ValidationMode,
     filter: PackageCacheLayerFilter,
+    validator: DirValidator,
+}
+
+/// The result of successfully validating a cache entry's directory: whatever
+/// package metadata the validator was able to read while it was at it, so
+/// that callers do not need to re-read it from disk immediately afterwards.
+///
+/// Conda packages have both an `index.json` and a `paths.json`; a wheel's
+/// synthesized equivalent is cheap to reconstruct from its `RECORD` file at
+/// install time, so a wheel validator returns `(None, None)` on success.
+type DirValidationResult = Result<(Option<IndexJson>, Option<PathsJson>), DirValidationError>;
+
+/// A type-erased error from a [`DirValidator`], since different archive
+/// kinds (conda, wheel) have their own, incompatible validation error types.
+type DirValidationError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// A pluggable directory validator, used by [`PackageCacheLayer`] to
+/// determine whether an entry's on-disk directory is a valid, complete
+/// extraction, parameterized by the kind of archive that was extracted
+/// there (conda vs. wheel - see [`PackageCacheLayer::with_validator`]).
+///
+/// This is what lets conda packages and wheels share every other piece of
+/// [`PackageCache`]'s machinery (locking, in-process de-duplication, revision
+/// tracking, atomic extraction) while still validating their very different
+/// on-disk layouts (`info/paths.json` vs. a wheel's `RECORD`) correctly.
+pub type DirValidator = Arc<dyn Fn(&Path, ValidationMode) -> DirValidationResult + Send + Sync>;
+
+/// The default [`DirValidator`] used by every [`PackageCacheLayer`] unless
+/// overridden via [`PackageCacheLayer::with_validator`]: validates a conda
+/// package directory against its `info/index.json`/`info/paths.json`.
+fn conda_validator() -> DirValidator {
+    Arc::new(|path, mode| {
+        validate_package_directory(path, mode)
+            .map(|(index_json, paths_json)| (Some(index_json), Some(paths_json)))
+            .map_err(|e| Box::new(e) as DirValidationError)
+    })
 }
 
 /// Controls which packages may be read from or written to a package-cache layer.
@@ -325,12 +362,28 @@ impl PackageCacheLayer {
             packages: Arc::new(DashMap::default()),
             validation_mode: ValidationMode::default(),
             filter: PackageCacheLayerFilter::default(),
+            validator: conda_validator(),
         }
     }
 
     /// Sets the validation mode used by this layer.
     pub fn with_validation_mode(mut self, validation_mode: ValidationMode) -> Self {
         self.validation_mode = validation_mode;
+        self
+    }
+
+    /// Overrides the [`DirValidator`] used by this layer to determine
+    /// whether an entry's on-disk directory is valid.
+    ///
+    /// Defaults to a validator for conda package directories
+    /// (`info/index.json`/`info/paths.json`). A layer that stores a
+    /// different kind of archive (e.g. wheels, whose on-disk layout is a
+    /// faithful, archive-relative unpack validated against their own
+    /// `RECORD` file - see
+    /// [`crate::validation::validate_wheel_directory`]) should override this.
+    #[must_use]
+    pub fn with_validator(mut self, validator: DirValidator) -> Self {
+        self.validator = validator;
         self
     }
 
@@ -398,6 +451,7 @@ impl PackageCacheLayer {
             None,
             None,
             self.validation_mode,
+            self.validator.clone(),
         )
         .await
         {
@@ -438,6 +492,7 @@ impl PackageCacheLayer {
             Some(fetch),
             reporter,
             self.validation_mode,
+            self.validator.clone(),
         )
         .await
         {
@@ -760,26 +815,62 @@ impl PackageCache {
         record: Option<&PackageRecord>,
         reporter: Option<Arc<dyn CacheReporter>>,
     ) -> Result<CacheMetadata, PackageCacheError> {
-        let path_buf = path.to_path_buf();
-        let mut cache_key: CacheKey = match record {
+        let cache_key: CacheKey = match record {
             Some(record) => record.into(),
-            None => CondaArchiveIdentifier::try_from_path(&path_buf)
-                .unwrap()
-                .into(),
+            None => CondaArchiveIdentifier::try_from_path(path).unwrap().into(),
         };
+
+        self.get_or_fetch_from_path_with_extractor(
+            cache_key,
+            path,
+            reporter,
+            |archive, destination| async move {
+                rattler_package_streaming::tokio::fs::extract(&archive, &destination).await
+            },
+        )
+        .await
+    }
+
+    /// Returns the directory that contains the specified package.
+    ///
+    /// This is a convenience wrapper around `get_or_fetch` which extracts a
+    /// local archive with `extractor` if the package could not be found in
+    /// the cache, instead of the built-in `.conda`/`.tar.bz2` extractor used
+    /// by [`Self::get_or_fetch_from_path`].
+    ///
+    /// This is what lets a different kind of archive (e.g. a `.whl`) share
+    /// every other guarantee [`PackageCache`] gives conda packages -
+    /// locking, in-process de-duplication, revision tracking, atomic
+    /// extraction - without `PackageCache` itself needing to know anything
+    /// wheel-specific. See [`PackageCacheLayer::with_validator`] for the
+    /// matching validation-side seam.
+    ///
+    /// If this cache was constructed with [`Self::with_cached_origin`], `path`
+    /// is folded into the cache key exactly like [`Self::get_or_fetch_from_path`]
+    /// does, so callers never need to apply it themselves.
+    pub async fn get_or_fetch_from_path_with_extractor<Ex, ExFut>(
+        &self,
+        pkg: impl Into<CacheKey>,
+        path: &Path,
+        reporter: Option<Arc<dyn CacheReporter>>,
+        extractor: Ex,
+    ) -> Result<CacheMetadata, PackageCacheError>
+    where
+        Ex: Fn(PathBuf, PathBuf) -> ExFut + Send + Sync + Clone + 'static,
+        ExFut: Future<Output = Result<ExtractResult, ExtractError>> + Send + 'static,
+    {
+        let mut cache_key = pkg.into();
         if self.cache_origin {
             cache_key = cache_key.with_path(path);
         }
+        let path_buf = path.to_path_buf();
 
         self.get_or_fetch(
             cache_key,
             move |destination| {
                 let path_buf = path_buf.clone();
-                async move {
-                    rattler_package_streaming::tokio::fs::extract(&path_buf, &destination)
-                        .await
-                        .map(|_| ())
-                }
+                let extractor = extractor.clone();
+                async move { extractor(path_buf, destination).await.map(|_| ()) }
             },
             reporter,
         )
@@ -812,6 +903,69 @@ impl PackageCache {
         reporter: Option<Arc<dyn CacheReporter>>,
         concurrent_requests_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     ) -> Result<CacheMetadata, PackageCacheError> {
+        self.get_or_fetch_from_url_with_extractor(
+            pkg,
+            url,
+            client,
+            retry_policy,
+            reporter,
+            concurrent_requests_semaphore,
+            |client, url, destination, expected_sha256, reporter| async move {
+                rattler_package_streaming::reqwest::tokio::extract(
+                    client,
+                    url,
+                    &destination,
+                    expected_sha256,
+                    reporter,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    /// Returns the directory that contains the specified package.
+    ///
+    /// This is the generalization of [`Self::get_or_fetch_from_url_with_retry`]
+    /// that downloads and extracts the archive using `extractor` instead of
+    /// the built-in `.conda`/`.tar.bz2` extractor. Every other guarantee -
+    /// the shared download-concurrency semaphore, the shared retry policy,
+    /// whole-archive hash verification with delete-and-retry on mismatch,
+    /// and atomic (tempdir-then-rename) extraction - applies identically
+    /// regardless of `extractor`, because none of it was ever specific to
+    /// conda's own extractor to begin with.
+    ///
+    /// `extractor` must have the same signature shape as
+    /// [`rattler_package_streaming::reqwest::tokio::extract`] and
+    /// [`rattler_package_streaming::reqwest::tokio::extract_wheel`] (which
+    /// this function's conda-specific sibling
+    /// [`Self::get_or_fetch_from_url_with_retry`] uses).
+    #[instrument(skip_all, fields(url=%url))]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn get_or_fetch_from_url_with_extractor<Ex, ExFut>(
+        &self,
+        pkg: impl Into<CacheKey>,
+        url: Url,
+        client: LazyClient,
+        retry_policy: impl RetryPolicy + Send + 'static + Clone,
+        reporter: Option<Arc<dyn CacheReporter>>,
+        concurrent_requests_semaphore: Option<Arc<tokio::sync::Semaphore>>,
+        extractor: Ex,
+    ) -> Result<CacheMetadata, PackageCacheError>
+    where
+        Ex: Fn(
+                reqwest_middleware::ClientWithMiddleware,
+                Url,
+                PathBuf,
+                Option<Sha256Hash>,
+                Option<Arc<dyn DownloadReporter>>,
+            ) -> ExFut
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+        ExFut: Future<Output = Result<ExtractResult, ExtractError>> + Send + 'static,
+    {
         let request_start = SystemTime::now();
         // Convert into cache key
         let mut cache_key = pkg.into();
@@ -829,6 +983,7 @@ impl PackageCache {
             let retry_policy = retry_policy.clone();
             let download_reporter = download_reporter.clone();
             let concurrent_requests_semaphore = concurrent_requests_semaphore.clone();
+            let extractor = extractor.clone();
             async move {
                 // Acquire a permit to limit the number of concurrent download
                 // and extraction operations. The permit is held until the
@@ -849,10 +1004,10 @@ impl PackageCache {
                     current_try += 1;
                     tracing::debug!("downloading {} to {}", &url, destination.display());
                     // Extract the package
-                    let result = rattler_package_streaming::reqwest::tokio::extract(
+                    let result = extractor(
                         client.client().clone(),
                         url.clone(),
-                        &destination,
+                        destination.clone(),
                         sha256,
                         download_reporter.clone().map(|reporter| Arc::new(PassthroughReporter {
                             reporter,
@@ -1045,6 +1200,7 @@ async fn validate_package_common<F, Fut, E>(
     fetch: Option<F>,
     reporter: Option<Arc<dyn CacheReporter>>,
     validation_mode: ValidationMode,
+    validator: DirValidator,
 ) -> Result<CacheMetadata, PackageCacheLayerError>
 where
     F: Fn(PathBuf) -> Fut + Send,
@@ -1094,8 +1250,9 @@ where
         }
 
         // Validate the package directory.
-        let validation_result = tokio::task::spawn_blocking(move || {
-            validate_package_directory(&path_inner, validation_mode)
+        let validation_result = tokio::task::spawn_blocking({
+            let validator = validator.clone();
+            move || (validator)(&path_inner, validation_mode)
         })
         .await;
 
@@ -1110,8 +1267,8 @@ where
                     revision: cache_revision,
                     sha256: locked_sha256,
                     path,
-                    index_json: Some(index_json),
-                    paths_json: Some(paths_json),
+                    index_json,
+                    paths_json,
                 });
             }
             Ok(Err(e)) => {
@@ -1265,6 +1422,7 @@ mod test {
         future::IntoFuture,
         net::SocketAddr,
         path::{Path, PathBuf},
+        str::FromStr,
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1291,6 +1449,7 @@ mod test {
     use rattler_digest::{
         Sha256, compute_bytes_digest, compute_file_digest, parse_digest_from_hex,
     };
+    use rattler_networking::LazyClient;
     use rattler_networking::retry_policies::{DoNotRetryPolicy, ExponentialBackoffBuilder};
     use reqwest::Client;
     use reqwest_middleware::ClientBuilder;
@@ -1300,7 +1459,9 @@ mod test {
     use tokio_stream::StreamExt;
     use url::Url;
 
-    use super::{PackageCache, PackageCacheLayer, cache_lock, rename_with_retry};
+    use super::{
+        PackageCache, PackageCacheLayer, PackageCacheLayerError, cache_lock, rename_with_retry,
+    };
     use crate::{
         package_cache::{CacheKey, PackageCacheError},
         validation::{ValidationMode, validate_package_directory},
@@ -1608,6 +1769,176 @@ mod test {
         // Make sure that the paths are the same as what we would expect from the
         // original tar archive.
         assert_eq!(current_paths, paths);
+    }
+
+    /// Builds a minimal, but structurally realistic, wheel archive.
+    fn build_test_wheel(path: &Path) {
+        use std::io::Write;
+
+        let file = File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+
+        zip.start_file("demo.py", options).unwrap();
+        zip.write_all(b"print('hello')\n").unwrap();
+
+        zip.start_file("demo-1.0.dist-info/RECORD", options)
+            .unwrap();
+        zip.write_all(b"demo.py,sha256=,16\ndemo-1.0.dist-info/RECORD,,\n")
+            .unwrap();
+
+        zip.finish().unwrap();
+    }
+
+    /// A [`DirValidator`] for wheels, mirroring the one used by the
+    /// `rattler` crate's `Installer` for wheel cache layers - see
+    /// [`crate::validation::validate_wheel_directory`].
+    fn wheel_validator() -> super::DirValidator {
+        Arc::new(|path, mode| {
+            crate::validation::validate_wheel_directory(path, mode)
+                .map(|()| (None, None))
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+        })
+    }
+
+    /// Proves that a wheel can be fetched, cached, and reused through
+    /// exactly the same `PackageCache` machinery (locking, revision
+    /// tracking, atomic extraction) as a conda package, by supplying a
+    /// wheel-flavored extractor and validator instead of the built-in
+    /// conda ones.
+    #[tokio::test]
+    async fn test_wheel_cache_via_extractor() {
+        let temp_dir = tempdir().unwrap();
+        let wheel_path = temp_dir.path().join("demo-1.0-py3-none-any.whl");
+        build_test_wheel(&wheel_path);
+        let wheel_url = Url::from_file_path(&wheel_path).unwrap();
+
+        let cache_dir = tempdir().unwrap();
+        let cache = PackageCache::from_layers(
+            [PackageCacheLayer::new(cache_dir.path()).with_validator(wheel_validator())],
+            false,
+        );
+
+        let package_record = PackageRecord::new(
+            PackageName::new_unchecked("demo"),
+            VersionWithSource::from_str("1.0").unwrap(),
+            "py3_none_any_0".to_string(),
+        );
+        let cache_key = CacheKey::from(&package_record);
+
+        let extract_wheel = |client, url, destination: PathBuf, sha256, reporter| async move {
+            rattler_package_streaming::reqwest::tokio::extract_wheel(
+                client,
+                url,
+                &destination,
+                sha256,
+                reporter,
+            )
+            .await
+        };
+
+        let cache_metadata = cache
+            .get_or_fetch_from_url_with_extractor(
+                cache_key.clone(),
+                wheel_url.clone(),
+                LazyClient::default(),
+                DoNotRetryPolicy,
+                None,
+                None,
+                extract_wheel,
+            )
+            .await
+            .unwrap();
+
+        // The cache holds a faithful, archive-relative unpack: the
+        // `.dist-info` directory is a root-level entry, not remapped under
+        // `site-packages/`.
+        assert!(
+            cache_metadata
+                .path()
+                .join("demo-1.0.dist-info/RECORD")
+                .is_file()
+        );
+        assert!(cache_metadata.path().join("demo.py").is_file());
+
+        // A second fetch should be served from the cache: deleting the
+        // source wheel proves no re-download/re-extraction happened.
+        std::fs::remove_file(&wheel_path).unwrap();
+        let cache_metadata_2 = cache
+            .get_or_fetch_from_url_with_extractor(
+                cache_key,
+                wheel_url,
+                LazyClient::default(),
+                DoNotRetryPolicy,
+                None,
+                None,
+                extract_wheel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cache_metadata.path(), cache_metadata_2.path());
+    }
+
+    /// A wheel whose expected sha256 (carried on the [`CacheKey`], exactly
+    /// like a conda package's) does not match what was actually downloaded
+    /// must be rejected and *not* cached, the same way a conda hash mismatch
+    /// is rejected by `get_or_fetch_from_url_with_retry`.
+    #[tokio::test]
+    async fn test_wheel_cache_hash_mismatch_is_rejected() {
+        let temp_dir = tempdir().unwrap();
+        let wheel_path = temp_dir.path().join("demo-1.0-py3-none-any.whl");
+        build_test_wheel(&wheel_path);
+        let wheel_url = Url::from_file_path(&wheel_path).unwrap();
+
+        let cache_dir = tempdir().unwrap();
+        let cache = PackageCache::from_layers(
+            [PackageCacheLayer::new(cache_dir.path()).with_validator(wheel_validator())],
+            false,
+        );
+
+        let bogus_sha256 =
+            parse_digest_from_hex::<Sha256>(&"0".repeat(64)).expect("valid hex digest");
+        let package_record = PackageRecord::new(
+            PackageName::new_unchecked("demo"),
+            VersionWithSource::from_str("1.0").unwrap(),
+            "py3_none_any_0".to_string(),
+        );
+        let cache_key = CacheKey::from(&package_record).with_sha256(bogus_sha256);
+
+        let extract_wheel = |client, url, destination: PathBuf, sha256, reporter| async move {
+            rattler_package_streaming::reqwest::tokio::extract_wheel(
+                client,
+                url,
+                &destination,
+                sha256,
+                reporter,
+            )
+            .await
+        };
+
+        let err = cache
+            .get_or_fetch_from_url_with_extractor(
+                cache_key,
+                wheel_url,
+                LazyClient::default(),
+                DoNotRetryPolicy,
+                None,
+                None,
+                extract_wheel,
+            )
+            .await
+            .unwrap_err();
+
+        assert_matches!(
+            err,
+            PackageCacheError::LayerError(e)
+                if matches!(
+                    e.downcast_ref::<PackageCacheLayerError>(),
+                    Some(PackageCacheLayerError::FetchError(_))
+                )
+        );
+        // Nothing should have been left behind in the cache.
+        assert!(cache.index().await.unwrap().is_empty());
     }
 
     /// A helper middleware function that fails the first two requests.

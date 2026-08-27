@@ -117,6 +117,21 @@ impl InstallationResultRecord {
         }
     }
 
+    /// Whether this record was installed as a Python wheel. See
+    /// [`ContentComparable::is_wheel`].
+    ///
+    /// Always `false` for the `Min` variant: [`MinimalPrefixRecord`] does
+    /// not carry archive-kind information.
+    pub fn is_wheel(&self) -> bool {
+        match self {
+            InstallationResultRecord::Max(prefix_record) => matches!(
+                prefix_record.repodata_record.identifier.archive_type,
+                rattler_conda_types::package::DistArchiveType::Wheel(_)
+            ),
+            InstallationResultRecord::Min(_) => false,
+        }
+    }
+
     /// Return reference to the underlying `python_site_packages_path`.
     pub fn python_site_packages_path(&self) -> Option<&str> {
         match self {
@@ -182,6 +197,28 @@ pub trait ContentComparable {
     fn size(&self) -> Option<u64>;
     fn noarch(&self) -> NoArchType;
     fn python_site_packages_path(&self) -> Option<&str>;
+
+    /// Whether this record was installed as a Python wheel (see
+    /// `crate::install::wheel`), rather than a regular conda package.
+    ///
+    /// Wheels are always linked using the noarch-python convention
+    /// internally (see the module docs of `crate::install::wheel`),
+    /// regardless of their own, real `noarch()` - which is left untouched
+    /// so it continues to drive solving correctly. Callers that need to
+    /// know whether a record needs noarch-python-specific handling (e.g.
+    /// relinking when the Python ABI changes, or `__pycache__` cleanup on
+    /// removal) must check `noarch().is_python() || is_wheel()`, not
+    /// `noarch().is_python()` alone.
+    ///
+    /// Defaults to `false`: only [`RepoDataRecord`] and [`PrefixRecord`]
+    /// carry the archive-kind information needed to answer this; in
+    /// particular [`MinimalPrefixRecord`] deliberately does not (it exists
+    /// to avoid reading more of a `conda-meta` entry than strictly
+    /// necessary for the common no-op case), so a wheel compared through it
+    /// is not detected as one.
+    fn is_wheel(&self) -> bool {
+        false
+    }
 }
 
 impl ContentComparable for InstallationResultRecord {
@@ -215,6 +252,10 @@ impl ContentComparable for InstallationResultRecord {
 
     fn python_site_packages_path(&self) -> Option<&str> {
         self.python_site_packages_path()
+    }
+
+    fn is_wheel(&self) -> bool {
+        InstallationResultRecord::is_wheel(self)
     }
 }
 
@@ -300,6 +341,12 @@ impl ContentComparable for PrefixRecord {
             .python_site_packages_path
             .as_deref()
     }
+    fn is_wheel(&self) -> bool {
+        matches!(
+            self.repodata_record.identifier.archive_type,
+            rattler_conda_types::package::DistArchiveType::Wheel(_)
+        )
+    }
 }
 
 impl ContentComparable for RepoDataRecord {
@@ -327,6 +374,12 @@ impl ContentComparable for RepoDataRecord {
     fn python_site_packages_path(&self) -> Option<&str> {
         self.package_record.python_site_packages_path.as_deref()
     }
+    fn is_wheel(&self) -> bool {
+        matches!(
+            self.identifier.archive_type,
+            rattler_conda_types::package::DistArchiveType::Wheel(_)
+        )
+    }
 }
 
 impl<T: ContentComparable> ContentComparable for &T {
@@ -350,6 +403,9 @@ impl<T: ContentComparable> ContentComparable for &T {
     }
     fn noarch(&self) -> NoArchType {
         T::noarch(self)
+    }
+    fn is_wheel(&self) -> bool {
+        T::is_wheel(self)
     }
     fn python_site_packages_path(&self) -> Option<&str> {
         T::python_site_packages_path(self)

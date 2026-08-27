@@ -36,34 +36,77 @@
 //! [`super::Transaction`] diffing exactly like for any other conda
 //! package: only the *installation strategy* differs, entirely as an
 //! implementation detail of this module.
+//!
+//! ## Caching
+//!
+//! Wheels are fetched and cached through the *same*
+//! [`rattler_cache::package_cache::PackageCache`] machinery conda packages
+//! use - cross-process locking, in-process de-duplication of concurrent
+//! identical fetches, a shared download-concurrency semaphore, retry on
+//! transient failure, whole-archive hash verification with
+//! delete-and-retry on mismatch, and atomic (tempdir-then-rename)
+//! extraction - just parameterized with a wheel-flavored extractor (see
+//! [`populate_wheel_cache`]) and directory validator (see
+//! [`wheel_validator`]) instead of the conda-specific ones. Wheels are
+//! kept in their own [`rattler_cache::package_cache::PackageCache`]
+//! instance, rooted at a separate directory (see
+//! [`super::Installer::with_wheel_cache_dir`]), so a wheel can never
+//! collide with a conda package cache entry that happens to share the same
+//! synthesized name/version/build string.
+//!
+//! The cache holds a faithful, archive-relative unpack of the wheel (the
+//! same layout `unzip` would produce) - *not* remapped onto the
+//! `site-packages`/`python-scripts` install convention. That remapping is
+//! applied only when computing each file's install-time destination (see
+//! [`crate::install::InstallOptions::is_wheel`]), which keeps the on-disk
+//! cache format independent of the remapping convention and lets the
+//! wheel's own `RECORD` hashes be validated directly against the cached
+//! files.
+//!
+//! A caller that wants to check whether a wheel is already cached (e.g. to
+//! build an offline-install exclusion set the way
+//! `rattler_solve`'s test suite does for conda packages via
+//! [`rattler_cache::package_cache::PackageCache::index`]) must query a
+//! `PackageCache` instance built the same way [`super::Installer::install`]
+//! builds its wheel cache - i.e. rooted at the wheel cache directory with a
+//! [`wheel_validator`]-validated layer - not the conda package cache
+//! instance: [`rattler_cache::package_cache::CacheIndex::contains_record`]
+//! answers correctly for whichever archive kind the queried `PackageCache`
+//! instance was actually built for, and a wheel is never present in a
+//! conda-flavored instance's layers (nor vice versa).
 
 use std::{
+    io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
+use rattler_cache::package_cache::{CacheReporter, DirValidator, PackageCache, PackageCacheError};
 use rattler_conda_types::{
-    NoArchType, RepoDataRecord,
+    NoArchType, Platform, RepoDataRecord,
     package::{
         EntryPoint, IndexJson, LinkJson, NoArchLinks, PathType, PathsEntry, PathsJson,
         PythonEntryPoints,
-        wheel::{WheelRecord, find_dist_info_dir, parse_console_scripts},
+        wheel::{
+            WheelRecord, find_dist_info_dir, is_wheel_script_path, map_wheel_archive_path,
+            parse_console_scripts,
+        },
     },
     prefix::Prefix,
     prefix_record::{self, Link, LinkType},
-    utils::{InvalidPathComponentError, ensure_safe_path_component},
 };
-use rattler_networking::LazyClient;
-use rattler_package_streaming::ExtractError;
+use rattler_networking::{LazyClient, retry_policies::default_retry_policy};
 
-use super::{InstallDriver, InstallError, InstallOptions, clobber_registry::ClobberRegistry};
+use super::{
+    InstallDriver, InstallError, InstallOptions, PythonInfo, clobber_registry::ClobberRegistry,
+};
 
 /// Errors that might occur while installing a wheel.
 #[derive(Debug, thiserror::Error)]
 pub enum WheelInstallError {
-    /// The wheel could not be downloaded or extracted.
+    /// The wheel could not be downloaded, cached, or extracted.
     #[error("failed to fetch wheel from '{0}'")]
-    FailedToFetch(String, #[source] Box<ExtractError>),
+    FailedToFetch(String, #[source] Box<PackageCacheError>),
 
     /// The wheel's `RECORD` file could not be read or parsed.
     #[error("failed to read the wheel's 'RECORD' file")]
@@ -72,11 +115,6 @@ pub enum WheelInstallError {
     /// The wheel's `entry_points.txt` file could not be read.
     #[error("failed to read the wheel's 'entry_points.txt' file")]
     FailedToReadEntryPoints(#[source] std::io::Error),
-
-    /// A record contained metadata that could be used to escape the cache or
-    /// installation prefix.
-    #[error(transparent)]
-    UnsafePackageRecord(#[from] InvalidPathComponentError),
 
     /// Linking the wheel's files into the prefix failed.
     #[error(transparent)]
@@ -87,81 +125,83 @@ pub enum WheelInstallError {
     Io(#[from] std::io::Error),
 }
 
-/// Computes the name of the directory, relative to the wheel cache root, in
-/// which an extracted wheel is (or should be) stored.
+/// The [`DirValidator`] used for the wheel [`rattler_cache::package_cache::PackageCacheLayer`],
+/// validating an extracted wheel directory against its own `RECORD`
+/// manifest (see [`rattler_cache::validation::validate_wheel_directory`])
+/// instead of a conda package's `info/index.json`/`info/paths.json`.
 ///
-/// The `_whl` suffix keeps the directory namespace distinct from the
-/// `name-version-build` directories used by the regular conda package cache,
-/// even though wheels are cached separately.
-fn wheel_cache_dir_name(record: &RepoDataRecord) -> Result<String, InvalidPathComponentError> {
-    let name = record.package_record.name.as_normalized();
-    let version = record.package_record.version.to_string();
-    let build = &record.package_record.build;
-    ensure_safe_path_component(name)?;
-    ensure_safe_path_component(&version)?;
-    ensure_safe_path_component(build)?;
-    Ok(format!("{name}-{version}-{build}_whl"))
+/// A successful validation never carries `IndexJson`/`PathsJson` data back
+/// (unlike the conda validator): a wheel's synthesized equivalent is cheap
+/// to reconstruct from its `RECORD` file at install time (see
+/// [`link_wheel_sync`]), so there is nothing worth caching here.
+pub fn wheel_validator() -> DirValidator {
+    Arc::new(|path, mode| {
+        rattler_cache::validation::validate_wheel_directory(path, mode)
+            .map(|()| (None, None))
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    })
 }
 
-/// Downloads (if necessary) and extracts the wheel referenced by `record`
-/// into a directory under `cache_dir`, returning the directory that contains
-/// the extracted wheel contents.
+/// Downloads (if necessary) and extracts the wheel referenced by `record`,
+/// returning the directory that contains the extracted wheel contents.
 ///
-/// If a previous extraction is already present (recognized by the presence
-/// of a `.dist-info` directory) it is reused as-is, mirroring the
-/// [`rattler_cache::validation::ValidationMode::Skip`] default used for the
-/// regular conda package cache: this is a presence check, not a full
-/// hash-verification of every file.
+/// This goes through the *same* [`PackageCache`] machinery a conda package
+/// fetch does - see the module-level "Caching" section - parameterized with
+/// [`rattler_package_streaming`]'s wheel extractor instead of its
+/// `.conda`/`.tar.bz2` one. `wheel_cache` must have been constructed with a
+/// [`wheel_validator`]-validated layer (see
+/// [`super::Installer::with_wheel_cache_dir`]).
 pub async fn populate_wheel_cache(
     record: &RepoDataRecord,
-    cache_dir: &Path,
+    wheel_cache: &PackageCache,
     downloader: LazyClient,
+    reporter: Option<Arc<dyn CacheReporter>>,
+    concurrent_requests_semaphore: Option<Arc<tokio::sync::Semaphore>>,
 ) -> Result<PathBuf, WheelInstallError> {
-    let dir_name = wheel_cache_dir_name(record)?;
-    let destination = cache_dir.join(&dir_name);
-
-    if find_dist_info_dir(&destination).is_ok() {
-        return Ok(destination);
-    }
-
-    fs_err::tokio::create_dir_all(cache_dir).await?;
-
-    let temp_dir = tempfile::Builder::new()
-        .prefix(&format!(".{dir_name}"))
-        .tempdir_in(cache_dir)?;
-
-    if record.url.scheme() == "file" {
+    let cache_metadata = if record.url.scheme() == "file" {
         let path = record.url.to_file_path().map_err(|()| {
             WheelInstallError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("could not convert '{}' to a file path", record.url),
             ))
         })?;
-        rattler_package_streaming::tokio::fs::extract_wheel(&path, temp_dir.path())
+
+        wheel_cache
+            .get_or_fetch_from_path_with_extractor(
+                &record.package_record,
+                &path,
+                reporter,
+                |archive, destination| async move {
+                    rattler_package_streaming::tokio::fs::extract_wheel(&archive, &destination)
+                        .await
+                },
+            )
             .await
-            .map_err(|e| WheelInstallError::FailedToFetch(record.url.to_string(), Box::new(e)))?;
     } else {
-        rattler_package_streaming::reqwest::tokio::extract_wheel(
-            downloader.client().clone(),
-            record.url.clone(),
-            temp_dir.path(),
-            record.package_record.sha256,
-            None,
-        )
-        .await
-        .map_err(|e| WheelInstallError::FailedToFetch(record.url.to_string(), Box::new(e)))?;
+        wheel_cache
+            .get_or_fetch_from_url_with_extractor(
+                &record.package_record,
+                record.url.clone(),
+                downloader,
+                default_retry_policy(),
+                reporter,
+                concurrent_requests_semaphore,
+                |client, url, destination: PathBuf, sha256, reporter| async move {
+                    rattler_package_streaming::reqwest::tokio::extract_wheel(
+                        client,
+                        url,
+                        &destination,
+                        sha256,
+                        reporter,
+                    )
+                    .await
+                },
+            )
+            .await
     }
+    .map_err(|e| WheelInstallError::FailedToFetch(record.url.to_string(), Box::new(e)))?;
 
-    // Take ownership of the temp directory so it isn't cleaned up, then
-    // atomically move it into place, exactly like the regular package cache
-    // does for conda packages.
-    let temp_path = temp_dir.keep();
-    if destination.is_dir() {
-        fs_err::tokio::remove_dir_all(&destination).await?;
-    }
-    fs_err::tokio::rename(&temp_path, &destination).await?;
-
-    Ok(destination)
+    Ok(cache_metadata.path().to_path_buf())
 }
 
 /// Reads the console-script entry points declared in the wheel's
@@ -261,11 +301,19 @@ pub fn link_wheel_sync(
     let wheel_record = WheelRecord::from_extracted_directory(cached_wheel_dir)
         .map_err(WheelInstallError::FailedToReadRecord)?;
 
+    // `relative_path` here is the *archive*-relative path (the cache holds a
+    // faithful, archive-relative unpack - see the module-level "Caching"
+    // section), exactly like a conda package's own `info/paths.json` uses a
+    // path relative to the package directory. `options.is_wheel` (set below)
+    // tells `compute_paths` to apply the `site-packages`/`python-scripts`
+    // remapping on top of this before resolving the install-time
+    // destination, instead of assuming it's already been applied the way a
+    // conda-build-produced `paths.json` would be.
     let paths = wheel_record
         .entries
         .iter()
         .map(|entry| PathsEntry {
-            relative_path: entry.mapped_path(),
+            relative_path: entry.archive_path.clone(),
             no_link: false,
             path_type: PathType::HardLink,
             prefix_placeholder: None,
@@ -290,33 +338,150 @@ pub fn link_wheel_sync(
     });
     options.index_json = Some(synthetic_index_json(package_record));
     options.link_json = Some(link_json);
+    options.is_wheel = true;
 
-    super::link_package_sync(cached_wheel_dir, target_dir, clobber_registry, options)
-        .map_err(WheelInstallError::Install)
+    // Extract what the shebang-fixup pass below needs before `options` (and
+    // its `target_prefix`/`python_info`) is consumed by `link_package_sync`.
+    let python_info = options.python_info.clone();
+    let target_prefix = options
+        .target_prefix
+        .clone()
+        .unwrap_or_else(|| target_dir.path().to_path_buf());
+    let platform = options.platform.unwrap_or(Platform::current());
+
+    let (paths, link_type) =
+        super::link_package_sync(cached_wheel_dir, target_dir, clobber_registry, options)
+            .map_err(WheelInstallError::Install)?;
+
+    // Rewrite any `#!python`/`#!pythonw` placeholder shebang (see the wheel
+    // spec's "scripts" category) to point at the real interpreter. Shebangs
+    // are a Unix-only execution mechanism, so there is nothing to do on
+    // Windows (where `.data/scripts/` content without a matching
+    // `console_scripts`/`gui_scripts` entry point is not made executable by
+    // any installer, rattler included).
+    if let Some(python_info) = &python_info
+        && platform.is_unix()
+    {
+        let target_prefix = target_prefix
+            .to_str()
+            .ok_or(InstallError::TargetPrefixIsNotUtf8)?;
+        fix_up_script_shebangs(&wheel_record, target_dir, python_info, target_prefix)?;
+    }
+
+    Ok((paths, link_type))
 }
 
-/// Downloads/extracts (if necessary) and installs the wheel described by
-/// `record` into `target_prefix`, writing a `PrefixRecord` to `conda-meta` in
-/// exactly the same way as for a regular conda package. This is the wheel
-/// equivalent of the internal `link_package` helper used by
-/// [`super::Installer`] for conda packages.
-#[allow(clippy::too_many_arguments)]
+/// Rewrites every `.data/scripts/` entry's placeholder shebang (see
+/// [`rewrite_wheel_script_shebang`]) after linking.
+fn fix_up_script_shebangs(
+    wheel_record: &WheelRecord,
+    target_dir: &Prefix,
+    python_info: &PythonInfo,
+    target_prefix: &str,
+) -> Result<(), WheelInstallError> {
+    for entry in &wheel_record.entries {
+        if !is_wheel_script_path(&entry.archive_path) {
+            continue;
+        }
+        let mapped = map_wheel_archive_path(&entry.archive_path);
+        let destination = target_dir
+            .path()
+            .join(python_info.get_python_noarch_target_path(&mapped));
+        rewrite_wheel_script_shebang(&destination, python_info, target_prefix)?;
+    }
+    Ok(())
+}
+
+/// Rewrites a `#!python`/`#!pythonw` placeholder shebang - the convention
+/// [the wheel spec](https://packaging.python.org/en/latest/specifications/binary-distribution-format/#script-wrapping)
+/// uses for scripts in `<name>-<version>.data/scripts/` that installers are
+/// expected to point at the *real* interpreter - to the environment's actual
+/// Python executable. A script whose first line is anything else (already a
+/// concrete interpreter path, or a `console_scripts`/`gui_scripts`-generated
+/// launcher, which already has the right shebang - see
+/// [`crate::install::entry_point`]) is left untouched.
+///
+/// Deliberately implemented as its own pass over the *destination* files
+/// after linking, rather than by threading a `PrefixPlaceholder` through the
+/// generic `link_file` machinery: that machinery's placeholder substitution
+/// is a single, environment-prefix-wide find/replace keyed on
+/// `InstallOptions::target_prefix`, not a per-file interpreter-path
+/// substitution, so reusing it here would mean stuffing an unrelated meaning
+/// into that field. Every affected file is rewritten via a fresh
+/// temp-file-then-rename, never by editing in place, so a hardlinked
+/// (shared-inode) cache entry is never mutated by this pass.
+fn rewrite_wheel_script_shebang(
+    path: &Path,
+    python_info: &PythonInfo,
+    target_prefix: &str,
+) -> Result<(), WheelInstallError> {
+    let content = match fs_err::read(path) {
+        Ok(content) => content,
+        // A symlink skipped during extraction (e.g. on Windows without the
+        // right privileges) may legitimately be missing; nothing to fix up.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(WheelInstallError::Io(e)),
+    };
+
+    let first_line_end = content
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(content.len());
+    let first_line = content[..first_line_end]
+        .strip_suffix(b"\r")
+        .unwrap_or(&content[..first_line_end]);
+
+    if first_line != b"#!python" && first_line != b"#!pythonw" {
+        return Ok(());
+    }
+
+    let shebang = python_info.shebang(target_prefix);
+    let mut new_content = Vec::with_capacity(shebang.len() + content.len() - first_line_end);
+    new_content.extend_from_slice(shebang.as_bytes());
+    new_content.extend_from_slice(&content[first_line_end..]);
+
+    let permissions = fs_err::metadata(path)?.permissions();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".rattler-shebang-fixup")
+        .tempfile_in(parent)
+        .map_err(WheelInstallError::Io)?;
+    temp.write_all(&new_content)
+        .map_err(WheelInstallError::Io)?;
+    temp.as_file()
+        .set_permissions(permissions)
+        .map_err(WheelInstallError::Io)?;
+    temp.persist(path)
+        .map_err(|e| WheelInstallError::Io(e.error))?;
+    Ok(())
+}
+
+/// Links an already-cached (extracted) wheel from `cached_wheel_dir` into
+/// `target_prefix`, writing a `PrefixRecord` to `conda-meta` in exactly the
+/// same way as for a regular conda package. This is the wheel equivalent of
+/// the internal `link_package` helper used by [`super::Installer`] for
+/// conda packages.
+///
+/// Unlike the previous version of this function, this does *not* fetch or
+/// extract the wheel itself: `cached_wheel_dir` must already be the
+/// directory returned by [`populate_wheel_cache`] for this exact `record`.
+/// Calling both in sequence for the same install used to fetch and extract
+/// every wheel twice, into a nested cache directory - see
+/// [`populate_wheel_cache`] and the module-level "Caching" section for how
+/// the two are now kept as separate steps precisely to avoid that.
 pub async fn install_wheel(
     record: &RepoDataRecord,
     target_prefix: &Prefix,
-    wheel_cache_dir: &Path,
-    downloader: LazyClient,
+    cached_wheel_dir: &Path,
     install_options: InstallOptions,
     driver: &InstallDriver,
     requested_specs: Vec<String>,
 ) -> Result<(), WheelInstallError> {
-    let cached_wheel_dir = populate_wheel_cache(record, wheel_cache_dir, downloader).await?;
-
     let record = record.clone();
     let target_prefix = target_prefix.clone();
     let clobber_registry = driver.clobber_registry.clone();
     let conda_meta_path = target_prefix.path().join("conda-meta");
-    let cached_wheel_dir_for_task = cached_wheel_dir.clone();
+    let cached_wheel_dir_for_task = cached_wheel_dir.to_path_buf();
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     rayon::spawn_fifo(move || {
@@ -374,6 +539,10 @@ mod test {
     ///   subdir-specific wheel -> also lands in `site-packages`
     /// - a `.data/scripts/` file -> lands in the environment's `bin`
     ///   directory alongside the generated entry point
+    /// - a `.data/scripts/` file with a `#!python` placeholder shebang, as
+    ///   real wheels ship per [the wheel
+    ///   spec](https://packaging.python.org/en/latest/specifications/binary-distribution-format/#script-wrapping)
+    ///   -> should be rewritten to the real interpreter path on install
     fn build_test_wheel(path: &std::path::Path) {
         let file = std::fs::File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
@@ -392,6 +561,7 @@ mod test {
         zip.write_all(
             b"demo.py,sha256=,29\n\
               demo-1.0.data/scripts/demo-data-script,sha256=,0\n\
+              demo-1.0.data/scripts/demo-shebang-script,sha256=,22\n\
               demo-1.0.data/platlib/_demo_native.so,sha256=,0\n\
               demo-1.0.dist-info/METADATA,,\n\
               demo-1.0.dist-info/RECORD,,\n",
@@ -406,6 +576,10 @@ mod test {
         zip.start_file("demo-1.0.data/scripts/demo-data-script", options)
             .unwrap();
         zip.write_all(b"").unwrap();
+
+        zip.start_file("demo-1.0.data/scripts/demo-shebang-script", options)
+            .unwrap();
+        zip.write_all(b"#!python\nprint('hi')\n").unwrap();
 
         zip.start_file("demo-1.0.data/platlib/_demo_native.so", options)
             .unwrap();
@@ -525,9 +699,9 @@ mod test {
                 .is_none()
         );
         // Every wheel-owned file should be tracked for uninstall/listing: the
-        // 5 files listed in `RECORD` plus the generated `demo-cli` entry
+        // 6 files listed in `RECORD` plus the generated `demo-cli` entry
         // point script (1 file on unix, 2 on windows).
-        let expected_paths = if cfg!(windows) { 7 } else { 6 };
+        let expected_paths = if cfg!(windows) { 8 } else { 7 };
         assert_eq!(installed_record.paths_data.paths.len(), expected_paths);
 
         let python_info = PythonInfo::from_version(
@@ -567,6 +741,54 @@ mod test {
             "entry point script should have been generated"
         );
 
+        // The `#!python` placeholder shebang was rewritten to point at the
+        // real interpreter (Unix only - shebangs are not an execution
+        // mechanism on Windows).
+        #[cfg(unix)]
+        {
+            let shebang_script_path = prefix_dir
+                .join(&python_info.bin_dir)
+                .join("demo-shebang-script");
+            let content = std::fs::read_to_string(&shebang_script_path).unwrap();
+            let first_line = content.lines().next().unwrap();
+            assert_ne!(
+                first_line, "#!python",
+                "the placeholder shebang should have been rewritten"
+            );
+            assert!(
+                first_line.starts_with("#!") && first_line.contains("python"),
+                "expected a shebang pointing at a python interpreter, got: {first_line}"
+            );
+            assert!(content.ends_with("print('hi')\n"));
+        }
+
+        // The wheel cache holds exactly one, non-nested extraction per
+        // wheel: a regression check for a bug where installing a wheel
+        // fetched and extracted it a second time into a directory nested
+        // inside the first.
+        let wheel_cache_dir = temp_dir.path().join("wheel-cache");
+        let mut extraction_dirs = std::fs::read_dir(&wheel_cache_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            extraction_dirs.len(),
+            1,
+            "expected exactly one top-level extraction directory in the wheel cache, found {extraction_dirs:?}"
+        );
+        let extraction_dir = extraction_dirs.pop().unwrap();
+        assert_eq!(
+            installed_record.extracted_package_dir.as_deref(),
+            Some(extraction_dir.as_path()),
+            "the installed record should point at the top-level cache extraction, not a nested copy"
+        );
+        // The cache holds a faithful, archive-relative unpack: `RECORD` is a
+        // root-level entry, not remapped under `site-packages/`.
+        assert!(extraction_dir.join("demo-1.0.dist-info/RECORD").is_file());
+        assert!(!extraction_dir.join("site-packages").exists());
+
         // --- Uninstall ---
         let result = Installer::new()
             .with_wheel_cache_dir(temp_dir.path().join("wheel-cache"))
@@ -596,6 +818,68 @@ mod test {
                 .join(&python_info.bin_dir)
                 .join("demo-data-script")
                 .exists()
+        );
+    }
+
+    /// A wheel whose repodata `sha256` does not match the archive actually
+    /// served must fail to install, rather than being silently linked and
+    /// tracked in `conda-meta` unverified (see the `WheelInstallError::FailedToFetch`
+    /// path in `populate_wheel_cache`, which now goes through the same
+    /// whole-archive hash verification a conda package fetch gets).
+    ///
+    /// This exercises a real HTTP fetch (a local server), not a `file://`
+    /// URL: like conda's own `get_or_fetch_from_path`, a *local* wheel
+    /// install intentionally does not hash-verify (see the module docs);
+    /// only a URL fetch does.
+    #[tokio::test]
+    async fn test_wheel_hash_mismatch_fails_install() {
+        use assert_matches::assert_matches;
+        use std::future::IntoFuture;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let wheel_path = temp_dir.path().join("demo-1.0-py3-none-any.whl");
+        build_test_wheel(&wheel_path);
+
+        let addr = std::net::SocketAddr::new([127, 0, 0, 1].into(), 0);
+        let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service = axum::Router::new()
+            .fallback_service(tower_http::services::ServeDir::new(temp_dir.path()))
+            .into_make_service();
+        tokio::spawn(axum::serve(listener, service).into_future());
+
+        let prefix_dir = temp_dir.path().join("prefix");
+        let prefix = Prefix::create(&prefix_dir).unwrap();
+
+        let python_record = fake_python_repodata_record();
+        let python_prefix_record =
+            PrefixRecord::from_repodata_record(python_record.clone(), Vec::new());
+        let conda_meta_dir = prefix_dir.join("conda-meta");
+        std::fs::create_dir_all(&conda_meta_dir).unwrap();
+        python_prefix_record
+            .write_to_path(conda_meta_dir.join(python_prefix_record.file_name()), true)
+            .unwrap();
+
+        let mut wheel_record = wheel_repodata_record(&wheel_path);
+        wheel_record.url = Url::parse(&format!("http://{addr}/demo-1.0-py3-none-any.whl")).unwrap();
+        wheel_record.package_record.sha256 =
+            rattler_digest::parse_digest_from_hex::<rattler_digest::Sha256>(&"0".repeat(64));
+
+        let result = Installer::new()
+            .with_wheel_cache_dir(temp_dir.path().join("wheel-cache"))
+            .install(&prefix, vec![python_record, wheel_record])
+            .await;
+
+        assert_matches!(
+            result,
+            Err(crate::install::InstallerError::FailedToInstallWheel(_, _))
+        );
+        assert!(
+            !prefix_dir
+                .join("conda-meta")
+                .join("demo-1.0-py3_none_any_0.json")
+                .exists(),
+            "a hash-mismatched wheel should not be tracked in conda-meta"
         );
     }
 }

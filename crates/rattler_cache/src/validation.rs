@@ -16,7 +16,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use rattler_conda_types::package::{IndexJson, PackageFile, PathType, PathsEntry, PathsJson};
+use rattler_conda_types::package::{
+    IndexJson, PackageFile, PathType, PathsEntry, PathsJson,
+    wheel::{WheelRecord, find_dist_info_dir},
+};
 use rattler_digest::{HashingWriter, Sha256};
 use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rayon::prelude::IndexedParallelIterator;
@@ -282,9 +285,123 @@ fn validate_package_directory_entry(
     }
 }
 
+/// An error that is returned by [`validate_wheel_directory`] if the contents
+/// of the directory seem to be corrupted or incomplete.
+#[derive(Debug, thiserror::Error)]
+pub enum WheelValidationError {
+    /// The wheel's `<name>-<version>.dist-info` directory could not be
+    /// found (see [`find_dist_info_dir`]).
+    #[error("could not find a wheel '.dist-info' directory")]
+    DistInfoMissing(#[source] std::io::Error),
+
+    /// The wheel's `RECORD` file could not be read or parsed.
+    #[error("failed to read the wheel's 'RECORD' file")]
+    ReadRecordError(#[source] std::io::Error),
+
+    /// A file listed in `RECORD` seems to be corrupted.
+    #[error("the file '{0}' listed in 'RECORD' seems to be corrupted")]
+    CorruptedEntry(PathBuf, #[source] PackageEntryValidationError),
+}
+
+/// Determine whether a directory containing an *extracted* wheel (see
+/// [`rattler_conda_types::package::wheel`] for the on-disk layout - a
+/// faithful, archive-relative unpack, not remapped onto the
+/// `site-packages`/`python-scripts` install convention) matches what its own
+/// `RECORD` manifest says it should contain.
+///
+/// This is the wheel equivalent of [`validate_package_directory`], used so
+/// that cached wheels get the same [`ValidationMode`]-driven guarantees as
+/// cached conda packages:
+///
+/// - `Skip` (the default): only checks that a `.dist-info` directory exists,
+///   exactly like the previous, hand-rolled wheel cache presence check.
+/// - `Fast`: additionally checks that every file listed in `RECORD` exists on
+///   disk, without re-hashing.
+/// - `Full`: additionally re-hashes every `RECORD` entry that has a known
+///   sha256 (some entries, including `RECORD` itself, legitimately have
+///   none per the wheel spec) and compares it.
+pub fn validate_wheel_directory(
+    package_dir: &Path,
+    mode: ValidationMode,
+) -> Result<(), WheelValidationError> {
+    find_dist_info_dir(package_dir).map_err(WheelValidationError::DistInfoMissing)?;
+
+    if mode == ValidationMode::Skip {
+        return Ok(());
+    }
+
+    let record = WheelRecord::from_extracted_directory(package_dir)
+        .map_err(WheelValidationError::ReadRecordError)?;
+
+    record
+        .entries
+        .par_iter()
+        .with_min_len(1000)
+        .try_for_each(|entry| {
+            validate_wheel_entry(package_dir, entry, mode)
+                .map_err(|e| WheelValidationError::CorruptedEntry(entry.archive_path.clone(), e))
+        })
+}
+
+/// Determine whether a single `RECORD` entry matches the file at its
+/// archive-relative path inside `package_dir`.
+fn validate_wheel_entry(
+    package_dir: &Path,
+    entry: &rattler_conda_types::package::wheel::WheelRecordEntry,
+    mode: ValidationMode,
+) -> Result<(), PackageEntryValidationError> {
+    let path = package_dir.join(&entry.archive_path);
+
+    if mode == ValidationMode::Fast {
+        if !path.is_file() {
+            return Err(PackageEntryValidationError::NotFound);
+        }
+        return Ok(());
+    }
+
+    debug_assert!(mode == ValidationMode::Full);
+
+    let file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Err(PackageEntryValidationError::NotFound);
+        }
+        Err(e) => return Err(PackageEntryValidationError::IoError(e)),
+    };
+
+    if let Some(size_in_bytes) = entry.size {
+        let actual_file_len = file
+            .metadata()
+            .map_err(PackageEntryValidationError::IoError)?
+            .len();
+        if size_in_bytes != actual_file_len {
+            return Err(PackageEntryValidationError::IncorrectSize(
+                size_in_bytes,
+                actual_file_len,
+            ));
+        }
+    }
+
+    if let Some(expected_hash) = &entry.sha256 {
+        let mut file = BufReader::with_capacity(64 * 1024, file);
+        let mut writer = HashingWriter::<_, Sha256>::new(std::io::sink());
+        std::io::copy(&mut file, &mut writer)?;
+        let (_, hash) = writer.finalize();
+
+        if expected_hash != &hash {
+            return Err(PackageEntryValidationError::HashMismatch(
+                hex::encode(expected_hash),
+                hex::encode(hash),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
-    use std::io::Write;
+    use std::{io::Write, path::Path};
 
     use assert_matches::assert_matches;
     use rattler_conda_types::package::{PackageFile, PathType, PathsJson};
@@ -413,6 +530,88 @@ mod test {
         assert_matches!(
             validate_package_directory(temp_dir.path(), ValidationMode::Full),
             Err(PackageValidationError::ReadIndexJsonError(_))
+        );
+    }
+
+    fn write_extracted_wheel(dir: &Path) {
+        std::fs::create_dir_all(dir.join("demo-1.0.dist-info")).unwrap();
+        let content: &[u8] = b"print('hello')\n";
+        std::fs::write(dir.join("demo.py"), content).unwrap();
+        // sha256 of `content`, base64url-nopad-encoded, matching the wheel
+        // `RECORD` format.
+        let hash = rattler_digest::compute_bytes_digest::<rattler_digest::Sha256>(content);
+        let encoded =
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, hash);
+        std::fs::write(
+            dir.join("demo-1.0.dist-info/RECORD"),
+            format!(
+                "demo.py,sha256={encoded},{}\ndemo-1.0.dist-info/RECORD,,\n",
+                content.len()
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_validate_wheel_directory_skip_only_checks_dist_info() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        // No RECORD/entries at all - Skip mode should still succeed as long
+        // as a `.dist-info` directory is present.
+        std::fs::create_dir_all(temp_dir.path().join("demo-1.0.dist-info")).unwrap();
+        super::validate_wheel_directory(temp_dir.path(), ValidationMode::Skip).unwrap();
+    }
+
+    #[test]
+    fn test_validate_wheel_directory_skip_fails_without_dist_info() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        assert_matches!(
+            super::validate_wheel_directory(temp_dir.path(), ValidationMode::Skip),
+            Err(super::WheelValidationError::DistInfoMissing(_))
+        );
+    }
+
+    #[test]
+    fn test_validate_wheel_directory_fast_and_full_succeed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_extracted_wheel(temp_dir.path());
+
+        super::validate_wheel_directory(temp_dir.path(), ValidationMode::Fast).unwrap();
+        super::validate_wheel_directory(temp_dir.path(), ValidationMode::Full).unwrap();
+    }
+
+    #[test]
+    fn test_validate_wheel_directory_fast_detects_missing_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_extracted_wheel(temp_dir.path());
+        std::fs::remove_file(temp_dir.path().join("demo.py")).unwrap();
+
+        assert_matches!(
+            super::validate_wheel_directory(temp_dir.path(), ValidationMode::Fast),
+            Err(super::WheelValidationError::CorruptedEntry(
+                path,
+                PackageEntryValidationError::NotFound
+            )) if path == Path::new("demo.py")
+        );
+    }
+
+    #[test]
+    fn test_validate_wheel_directory_full_detects_hash_mismatch() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        write_extracted_wheel(temp_dir.path());
+        let original_len = b"print('hello')\n".len();
+        let tampered = "x".repeat(original_len - 1) + "\n";
+        std::fs::write(temp_dir.path().join("demo.py"), tampered.as_bytes()).unwrap();
+        assert_eq!(tampered.len(), original_len);
+
+        // Fast mode does not re-hash, so it does not notice the tampering.
+        super::validate_wheel_directory(temp_dir.path(), ValidationMode::Fast).unwrap();
+
+        assert_matches!(
+            super::validate_wheel_directory(temp_dir.path(), ValidationMode::Full),
+            Err(super::WheelValidationError::CorruptedEntry(
+                path,
+                PackageEntryValidationError::HashMismatch(_, _)
+            )) if path == Path::new("demo.py")
         );
     }
 }

@@ -653,6 +653,24 @@ impl Installer {
                 .expect("failed to determine default cache directory")
                 .join(rattler_cache::WHEEL_CACHE_DIR)
         });
+        // Wheels get their own `PackageCache` instance, rooted at a separate
+        // directory from the conda package cache, so a wheel can never
+        // collide with a conda cache entry that happens to share the same
+        // synthesized name/version/build string - see the "Caching" section
+        // of `crate::install::wheel`'s module documentation. `with_cached_origin`
+        // folds the wheel's URL (or local path) into its cache key
+        // unconditionally, which is more conservative than conda's own
+        // opt-in default: a wheel's build string is synthesized from wheel
+        // tags in v3 repodata rather than being a hash-derived filename, so
+        // name+version+build alone is a weaker uniqueness guarantee than it
+        // is for a conda archive.
+        let wheel_cache = rattler_cache::package_cache::PackageCache::from_layers(
+            [
+                rattler_cache::package_cache::PackageCacheLayer::new(wheel_cache_dir)
+                    .with_validator(crate::install::wheel::wheel_validator()),
+            ],
+            true,
+        );
 
         // Acquire a global lock on the package cache for the entire installation.
         // This significantly reduces overhead by avoiding per-package locking.
@@ -752,7 +770,7 @@ impl Installer {
         {
             let downloader = &downloader;
             let package_cache = &package_cache;
-            let wheel_cache_dir = &wheel_cache_dir;
+            let wheel_cache = &wheel_cache;
             let reporter = self.reporter.clone();
             let base_install_options = &base_install_options;
             let driver = &driver;
@@ -772,7 +790,7 @@ impl Installer {
                     let downloader = downloader.clone();
                     let reporter = reporter.clone();
                     let package_cache = package_cache.clone();
-                    let wheel_cache_dir = wheel_cache_dir.clone();
+                    let wheel_cache = wheel_cache.clone();
                     let concurrent_requests_semaphore = concurrent_requests_semaphore.clone();
                     tokio::spawn(async move {
                         let populate_cache_report = reporter.clone().map(|r| {
@@ -783,10 +801,14 @@ impl Installer {
                             record.identifier.archive_type,
                             DistArchiveType::Wheel(_)
                         ) {
+                            let cache_reporter =
+                                cache_reporter_bridge(populate_cache_report.clone());
                             let cached_dir = crate::install::wheel::populate_wheel_cache(
                                 &record,
-                                &wheel_cache_dir,
+                                &wheel_cache,
                                 downloader,
+                                cache_reporter,
+                                concurrent_requests_semaphore,
                             )
                             .await
                             .map_err(|e| {
@@ -859,7 +881,6 @@ impl Installer {
                                 &record,
                                 prefix,
                                 &cached_wheel_dir,
-                                downloader.clone(),
                                 base_install_options.clone(),
                                 driver,
                                 requested_spec,
@@ -997,15 +1018,15 @@ async fn link_package(
     rx.await.unwrap_or(Err(InstallerError::Cancelled))
 }
 
-/// Given a repodata record, fetch the package into the cache if its not already
-/// there.
-async fn populate_cache(
-    record: &RepoDataRecord,
-    downloader: LazyClient,
-    cache: &PackageCache,
+/// Bridges the installer's own [`Reporter`] trait into the archive-agnostic
+/// [`CacheReporter`] trait [`rattler_cache::package_cache::PackageCache`]
+/// expects, for a single cache-populate operation (`cache_index`). Used for
+/// both conda packages ([`populate_cache`]) and wheels (in [`Installer::install`]),
+/// since bridging progress events is exactly as archive-agnostic as the
+/// caching machinery itself.
+fn cache_reporter_bridge(
     reporter: Option<(Arc<dyn Reporter>, usize)>,
-    concurrent_requests_semaphore: Option<Arc<Semaphore>>,
-) -> Result<CacheMetadata, InstallerError> {
+) -> Option<Arc<dyn CacheReporter>> {
     struct CacheReporterBridge {
         reporter: Arc<dyn Reporter>,
         cache_index: usize,
@@ -1033,12 +1054,24 @@ async fn populate_cache(
         }
     }
 
-    let reporter = reporter.map(|(reporter, cache_index)| {
+    reporter.map(|(reporter, cache_index)| {
         Arc::new(CacheReporterBridge {
             reporter,
             cache_index,
         }) as _
-    });
+    })
+}
+
+/// Given a repodata record, fetch the package into the cache if its not already
+/// there.
+async fn populate_cache(
+    record: &RepoDataRecord,
+    downloader: LazyClient,
+    cache: &PackageCache,
+    reporter: Option<(Arc<dyn Reporter>, usize)>,
+    concurrent_requests_semaphore: Option<Arc<Semaphore>>,
+) -> Result<CacheMetadata, InstallerError> {
+    let reporter = cache_reporter_bridge(reporter);
 
     if record.url.scheme() == "file" {
         let path = record.url.to_file_path().map_err(|()| {

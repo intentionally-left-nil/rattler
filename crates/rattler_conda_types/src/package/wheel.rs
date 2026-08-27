@@ -15,13 +15,24 @@
 //!   again, the environment's script/binary directory, an `include`
 //!   directory, and the environment root).
 //!
-//! [`map_wheel_archive_path`] implements this remapping. It is used both
-//! while extracting a wheel archive (to decide where on disk each entry
-//! should be written) and while turning the wheel's `RECORD` file into a
-//! rattler [`crate::prefix_record::PathsEntry`]-like manifest (to decide the
-//! logical, noarch-python-style `relative_path` of each installed file, see
-//! [`crate::package::PathsEntry`] and the `site-packages/`/`python-scripts/`
-//! prefix convention used for `noarch: python` conda packages).
+//! [`map_wheel_archive_path`] implements this remapping. It is used while
+//! turning the wheel's `RECORD` file into a rattler
+//! [`crate::prefix_record::PathsEntry`]-like manifest (to decide the
+//! logical, noarch-python-style destination path of each installed file,
+//! see [`crate::package::PathsEntry`] and the `site-packages/`/
+//! `python-scripts/` prefix convention used for `noarch: python` conda
+//! packages).
+//!
+//! Deliberately, this remapping is *not* applied while extracting the wheel
+//! archive itself: the package cache holds a faithful, archive-relative
+//! unpack of the wheel (the same layout `unzip` would produce), and the
+//! `site-packages`/`python-scripts` remapping is applied only when computing
+//! each file's install-time destination. This keeps the on-disk cache format
+//! independent of this remapping convention, so that a future change to the
+//! convention (e.g. a more faithful `headers` mapping) does not silently
+//! invalidate or corrupt existing cache entries, and so that the wheel's own
+//! `RECORD` hashes can be validated directly against the cached files without
+//! having to reverse the remapping first.
 //!
 //! This module intentionally only deals with information that must be read
 //! from the wheel's own contents: the file manifest (`RECORD`) and console
@@ -36,6 +47,58 @@ use std::{
 
 use base64::Engine;
 use rattler_digest::Sha256Hash;
+
+/// The category of a path inside a wheel's `<name>-<version>.data/`
+/// directory, as defined by [the wheel
+/// specification](https://packaging.python.org/en/latest/specifications/binary-distribution-format/).
+/// `None` (returned by [`wheel_archive_category`]) means the path is not
+/// inside a `*.data/` directory at all, i.e. it is a "root" wheel file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WheelDataCategory {
+    /// `<name>-<version>.data/purelib/` - installed into `site-packages/`.
+    Purelib,
+    /// `<name>-<version>.data/platlib/` - installed into `site-packages/`.
+    Platlib,
+    /// `<name>-<version>.data/scripts/` - installed into the environment's
+    /// script/binary directory.
+    Scripts,
+    /// `<name>-<version>.data/headers/` - installed as-is, relative to the
+    /// environment root (see [`map_wheel_archive_path`] for the caveat about
+    /// this simplification).
+    Headers,
+    /// `<name>-<version>.data/data/`, or any future/unrecognized category -
+    /// installed as-is, relative to the environment root.
+    Data,
+}
+
+/// Determines whether `path` (as it appears inside a wheel archive, or in a
+/// wheel's `RECORD` file) is inside a `<name>-<version>.data/<category>/`
+/// directory, and if so, returns the category together with the path
+/// relative to that category directory.
+pub fn wheel_archive_category(path: &Path) -> Option<(WheelDataCategory, PathBuf)> {
+    let components: Vec<Component<'_>> = path.components().collect();
+
+    let Some(Component::Normal(first)) = components.first() else {
+        return None;
+    };
+    if !first.to_string_lossy().ends_with(".data") || components.len() < 2 {
+        return None;
+    }
+    let Component::Normal(category) = &components[1] else {
+        return None;
+    };
+
+    let rest: PathBuf = components[2..].iter().collect();
+    let category = match category.to_string_lossy().as_ref() {
+        "purelib" => WheelDataCategory::Purelib,
+        "platlib" => WheelDataCategory::Platlib,
+        "scripts" => WheelDataCategory::Scripts,
+        "headers" => WheelDataCategory::Headers,
+        // "data", or any future/unknown category.
+        _ => WheelDataCategory::Data,
+    };
+    Some((category, rest))
+}
 
 /// Maps a path as it appears inside a wheel archive (or a wheel's `RECORD`
 /// file) onto the logical, install-location-relative path that rattler uses
@@ -62,23 +125,27 @@ use rattler_digest::Sha256Hash;
 ///   correct for virtually all Python installations where both concepts
 ///   resolve to the same `site-packages` directory.
 pub fn map_wheel_archive_path(path: &Path) -> PathBuf {
-    let components: Vec<Component<'_>> = path.components().collect();
-
-    if let Some(Component::Normal(first)) = components.first()
-        && first.to_string_lossy().ends_with(".data")
-        && components.len() >= 2
-        && let Component::Normal(category) = &components[1]
-    {
-        let rest: PathBuf = components[2..].iter().collect();
-        return match category.to_string_lossy().as_ref() {
-            "purelib" | "platlib" => Path::new("site-packages").join(rest),
-            "scripts" => Path::new("python-scripts").join(rest),
-            // "headers", "data", or any future/unknown category.
-            _ => rest,
+    if let Some((category, rest)) = wheel_archive_category(path) {
+        return match category {
+            WheelDataCategory::Purelib | WheelDataCategory::Platlib => {
+                Path::new("site-packages").join(rest)
+            }
+            WheelDataCategory::Scripts => Path::new("python-scripts").join(rest),
+            WheelDataCategory::Headers | WheelDataCategory::Data => rest,
         };
     }
 
     Path::new("site-packages").join(path)
+}
+
+/// Returns `true` if `path` (a wheel archive path) is installed into the
+/// environment's script/binary directory, i.e. maps under
+/// `python-scripts/` (see [`map_wheel_archive_path`]).
+pub fn is_wheel_script_path(path: &Path) -> bool {
+    matches!(
+        wheel_archive_category(path),
+        Some((WheelDataCategory::Scripts, _))
+    )
 }
 
 /// A single entry of a wheel's `RECORD` file.
@@ -159,8 +226,7 @@ impl WheelRecord {
     }
 
     /// Reads and parses the `RECORD` file that was extracted from a wheel
-    /// archive into `extracted_wheel_dir` (using [`map_wheel_archive_path`]
-    /// to locate the `.dist-info` directory under `site-packages/`).
+    /// archive into `extracted_wheel_dir`.
     ///
     /// See [`find_dist_info_dir`] for how the `.dist-info` directory is
     /// located.
@@ -175,14 +241,14 @@ impl WheelRecord {
 /// Locates the single `<name>-<version>.dist-info` directory inside an
 /// extracted wheel directory.
 ///
-/// The wheel's own root-level files (which includes the `.dist-info`
-/// directory) are extracted under `site-packages/` (see
-/// [`map_wheel_archive_path`]), so this looks for a directory whose name ends
-/// with `.dist-info` directly under `extracted_wheel_dir/site-packages`.
+/// The extracted wheel directory holds a faithful, archive-relative unpack
+/// of the wheel (i.e. the same layout `unzip` would produce, *not* remapped
+/// via [`map_wheel_archive_path`] - see the module-level documentation), so
+/// the `.dist-info` directory (a root-level entry in every wheel archive) is
+/// looked for directly under `extracted_wheel_dir`.
 pub fn find_dist_info_dir(extracted_wheel_dir: &Path) -> io::Result<PathBuf> {
-    let site_packages = extracted_wheel_dir.join("site-packages");
     let mut found = None;
-    for entry in fs_err::read_dir(&site_packages)? {
+    for entry in fs_err::read_dir(extracted_wheel_dir)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             let name = entry.file_name();
@@ -327,6 +393,27 @@ mod test {
             map_wheel_archive_path(Path::new("foo-1.0.data/headers/foo.h")),
             Path::new("foo.h")
         );
+    }
+
+    #[test]
+    fn test_is_wheel_script_path() {
+        assert!(is_wheel_script_path(Path::new(
+            "foo-1.0.data/scripts/foo-cli"
+        )));
+        assert!(!is_wheel_script_path(Path::new(
+            "foo-1.0.data/purelib/foo/bar.py"
+        )));
+        assert!(!is_wheel_script_path(Path::new("foo.py")));
+    }
+
+    #[test]
+    fn test_find_dist_info_dir_looks_at_archive_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("foo-1.0.dist-info")).unwrap();
+        std::fs::write(temp_dir.path().join("foo.py"), "").unwrap();
+
+        let found = find_dist_info_dir(temp_dir.path()).unwrap();
+        assert_eq!(found, temp_dir.path().join("foo-1.0.dist-info"));
     }
 
     #[test]

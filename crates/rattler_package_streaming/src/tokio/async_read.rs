@@ -233,9 +233,10 @@ pub async fn extract_conda_via_buffering(
 /// archive is being read (e.g. while it's being downloaded), without
 /// requiring the whole archive to be buffered first.
 ///
-/// Each entry's (remapped, see
-/// [`rattler_conda_types::package::wheel::map_wheel_archive_path`])
-/// destination path is written to as soon as its local file header is
+/// Each entry's original archive-relative destination path (i.e. the same
+/// layout `unzip` would produce; see the module-level documentation of
+/// [`rattler_conda_types::package::wheel`] for why no remapping is applied
+/// during extraction) is written to as soon as its local file header is
 /// encountered. Unix executable permission bits, however, are only stored in
 /// the *central directory* at the end of the archive - not in the local
 /// headers - so after streaming through every entry, this continues reading
@@ -302,9 +303,12 @@ pub async fn extract_wheel(
             offset = zip_reader.offset();
             continue;
         };
-        let out_path = destination.join(
-            rattler_conda_types::package::wheel::map_wheel_archive_path(&relpath),
-        );
+        // Preserve the original archive-relative layout (i.e. the same
+        // layout `unzip` would produce): the `site-packages`/
+        // `python-scripts` remapping is applied later, at install time, not
+        // during extraction. See the module-level documentation of
+        // `rattler_conda_types::package::wheel` for why.
+        let out_path = destination.join(&relpath);
 
         if is_dir {
             tokio::fs::create_dir_all(&out_path)
@@ -537,7 +541,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_extract_wheel_streaming_remaps_paths_and_preserves_exec_bit() {
+    async fn test_extract_wheel_streaming_preserves_raw_layout_and_exec_bit() {
         let temp_dir = tempfile::tempdir().unwrap();
         let wheel_path = temp_dir.path().join("demo-1.0-py3-none-any.whl");
         build_test_wheel(&wheel_path);
@@ -548,17 +552,17 @@ mod test {
             .unwrap();
         assert!(result.total_size > 0);
 
-        assert!(destination.join("site-packages/demo.py").is_file());
+        // Every entry is extracted at its original, archive-relative path -
+        // no remapping is applied during extraction.
+        assert!(destination.join("demo.py").is_file());
+        assert!(destination.join("demo-1.0.dist-info/RECORD").is_file());
+        let script_path = destination.join("demo-1.0.data/scripts/demo-native-cli");
+        assert!(script_path.is_file());
         assert!(
             destination
-                .join("site-packages/demo-1.0.dist-info/RECORD")
+                .join("demo-1.0.data/platlib/_demo_native.so")
                 .is_file()
         );
-        // `.data/scripts/` maps to `python-scripts/`.
-        let script_path = destination.join("python-scripts/demo-native-cli");
-        assert!(script_path.is_file());
-        // `.data/platlib/` (compiled/subdir-specific content) maps to `site-packages/`.
-        assert!(destination.join("site-packages/_demo_native.so").is_file());
 
         #[cfg(unix)]
         {
@@ -576,7 +580,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_extract_wheel_via_buffering_remaps_paths_and_preserves_exec_bit() {
+    async fn test_extract_wheel_via_buffering_preserves_raw_layout_and_exec_bit() {
         let temp_dir = tempfile::tempdir().unwrap();
         let wheel_path = temp_dir.path().join("demo-1.0-py3-none-any.whl");
         build_test_wheel(&wheel_path);
@@ -587,10 +591,14 @@ mod test {
             .unwrap();
         assert!(result.total_size > 0);
 
-        assert!(destination.join("site-packages/demo.py").is_file());
-        let script_path = destination.join("python-scripts/demo-native-cli");
+        assert!(destination.join("demo.py").is_file());
+        let script_path = destination.join("demo-1.0.data/scripts/demo-native-cli");
         assert!(script_path.is_file());
-        assert!(destination.join("site-packages/_demo_native.so").is_file());
+        assert!(
+            destination
+                .join("demo-1.0.data/platlib/_demo_native.so")
+                .is_file()
+        );
 
         #[cfg(unix)]
         {

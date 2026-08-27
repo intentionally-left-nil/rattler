@@ -5,7 +5,6 @@ use crate::ExtractError;
 use crate::read::{stream_tar_bz2, stream_tar_zst};
 use rattler_conda_types::package::CondaArchiveType;
 use rattler_conda_types::package::PackageFile;
-use rattler_conda_types::package::wheel::map_wheel_archive_path;
 use std::fs::File;
 use std::io::Write;
 use std::{
@@ -138,9 +137,11 @@ pub fn read_package_file<P: PackageFile>(path: impl AsRef<Path>) -> Result<P, Ex
 }
 
 /// Extracts the contents of a wheel archive (a plain zip file) into
-/// `destination`, remapping each entry's path onto rattler's
-/// noarch-python-style install convention using
-/// [`map_wheel_archive_path`].
+/// `destination`, preserving each entry's original archive-relative path
+/// (i.e. the same layout `unzip` would produce). See the module-level
+/// documentation of [`rattler_conda_types::package::wheel`] for why the
+/// `site-packages`/`python-scripts` remapping is deliberately *not* applied
+/// here.
 ///
 /// Unlike `.conda`/`.tar.bz2` extraction this does not stream: it requires a
 /// [`Seek`]-able reader since the underlying [`zip::ZipArchive`] needs random
@@ -163,8 +164,7 @@ pub fn extract_wheel_contents<R: Read + Seek>(
             // Skip entries with unsafe (e.g. zip-slip) paths.
             continue;
         };
-        let mapped = map_wheel_archive_path(&enclosed);
-        let out_path = destination.join(&mapped);
+        let out_path = destination.join(&enclosed);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent)?;
         }

@@ -258,9 +258,13 @@ where
                         old: old_record,
                         new: record,
                     });
-                } else if needs_python_relink && old_record.noarch().is_python() {
+                } else if needs_python_relink
+                    && (old_record.noarch().is_python() || old_record.is_wheel())
+                {
                     // when the python version changed, we need to relink all noarch packages
-                    // to recompile the bytecode
+                    // (including wheels, which are always linked using the noarch-python
+                    // convention internally regardless of their own declared `noarch` -
+                    // see `crate::install::wheel`) to recompile the bytecode
                     operations.push(TransactionOperation::Reinstall {
                         old: old_record,
                         new: record,
@@ -397,7 +401,12 @@ fn find_python_info(
 ) -> Result<Option<PythonInfo>, PythonInfoError> {
     records
         .into_iter()
-        .find(|r| r.name().as_normalized() == "python")
+        // A wheel can be named "python" (e.g. a PyPI package that happens to
+        // share the name) without being an actual Python interpreter
+        // installation - unlike a conda `python` package, nothing about a
+        // wheel's own metadata says it provides `bin/python`. Only a real
+        // conda package can drive `PythonInfo`.
+        .find(|r| r.name().as_normalized() == "python" && !r.is_wheel())
         .map(|record| {
             PythonInfo::from_version(
                 record.version(),

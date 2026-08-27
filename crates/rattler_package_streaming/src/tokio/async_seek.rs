@@ -127,9 +127,7 @@ pub async fn extract_wheel(
             )
         };
 
-        let out_path = destination.join(
-            rattler_conda_types::package::wheel::map_wheel_archive_path(&relpath),
-        );
+        let out_path = destination.join(&relpath);
 
         if is_dir {
             tokio::fs::create_dir_all(&out_path)
